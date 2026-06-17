@@ -1,10 +1,12 @@
 # Vlk — Memory-as-Action for LLM Agents
 
-Dead context kills long-running agents. Vlk gives them a scalpel, not a sledgehammer.
+Dead context kills long-running agents. Vlk gives them a scalpel, not a sledgehammer — and doubles as persistent memory for your IDE's coding agent.
 
 ## What it does
 
-Vlk is a native [MCP](https://modelcontextprotocol.io) server exposing a single tool: `vlk_time_travel`. Your agent calls it when it detects a failure loop or context bloat — Vlk atomically prunes dead memory slots from SQLite and injects the lesson learned.
+Vlk is a native [MCP](https://modelcontextprotocol.io) server that acts as **persistent working memory for IDE coding agents**. It exposes a single tool — `vlk_time_travel` — that your agent calls when it detects a failure loop or context bloat. Vlk atomically prunes dead memory slots from SQLite and injects the lesson learned.
+
+Unlike ephemeral chat context that vanishes between sessions, Vlk's SQLite-backed `agent_history` table survives restarts. Your Zed or Cursor agent picks up right where it left off — lessons intact, dead ends gone.
 
 ```
 [mem_id:5] London: API error 503
@@ -22,9 +24,9 @@ No external controllers, no fixed heuristics. The agent curates its own working 
 
 ```
 Zed / Cursor / Claude Desktop
-  │  stdio + JSON-RPC
+  │  agent calls vlk_time_travel via stdio JSON-RPC
   ▼
-vlk-core (Rust)
+vlk-core (Rust) ← persistent memory layer for the IDE
   │  tools/list  → vlk_time_travel
   │  tools/call  → atomic DELETE + INSERT
   ▼
@@ -40,12 +42,15 @@ SQLite (WAL) — agent_history
 | **Context window pressure** | Long-running task accumulating dead branches. Agent periodically prunes abandoned reasoning paths, reclaims tokens. |
 | **Multi-turn task decomposition** | Agent explores 5 approaches, 4 dead-end. Prunes dead ends, keeps winning strategy + rationale for downstream steps. |
 | **Self-correction** | Agent realizes early assumption was wrong. Prunes reasoning built on it, injects corrected premise, re-derives from clean state. |
+| **IDE session persistence** | You close Zed, reopen tomorrow. Agent reads `agent_history`, sees pruned failures + injected lessons from yesterday. Continues without repeating the same mistakes. |
 
 ## Run
 
 ```bash
 cd vlk-core && cargo build --release
 ```
+
+Your IDE's agent will use the SQLite database (`vlk.db`, created automatically on first run) as persistent memory across sessions.
 
 ### Zed
 
@@ -54,7 +59,7 @@ cd vlk-core && cargo build --release
 {
   "context_servers": {
     "VlkMemAct": {
-      "command": "/Users/jhonny/lab/agora/vlk-core/target/release/vlk-core"
+      "command": "/absolute/path/to/vlk-core/target/release/vlk-core"
     }
   }
 }
