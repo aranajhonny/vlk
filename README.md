@@ -58,10 +58,14 @@ Your IDE's agent will use the SQLite database (`vlk.db`, created automatically o
 // .zed/settings.json
 {
   "context_servers": {
-    "VlkMemAct": {
-      "command": "/absolute/path/to/vlk-core/target/release/vlk-core"
-    }
-  }
+    "vlk": {
+      "command": "/Users/jhonny/lab/agora/vlk-core/target/debug/vlk-core",
+      "args": [],
+      "env": {
+        "DATABASE_URL": "sqlite:/Users/jhonny/lab/agora/vlk-core/vlk.db?mode=rwc",
+      },
+    },
+  },
 }
 ```
 
