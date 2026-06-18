@@ -1,9 +1,15 @@
-use anyhow::{Context, Result};
-use chrono::Utc;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, warn};
+
+mod memory;
+
+use memory::chronesthesia::{
+    self, execute_time_travel, fetch_clean_context, get_session_summary, get_timeline,
+    search_timeline, TimeTravelArgs,
+};
 
 // ── JSON-RPC Types ───────────────────────────────────────────────────────────
 #[derive(Debug, Deserialize)]
@@ -33,43 +39,6 @@ struct JsonRpcError {
     message: String,
 }
 
-// ── Tool Input Types ─────────────────────────────────────────────────────────
-#[derive(Debug, Deserialize)]
-struct TimeTravelArgs {
-    session_id: Option<String>,
-    target_mem_ids: Vec<i64>,
-    learning: String,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct GetHistoryArgs {
-    session_id: Option<String>,
-    limit: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SearchMemoryArgs {
-    session_id: Option<String>,
-    query: String,
-    limit: Option<i64>,
-}
-
-// ── Data Models ──────────────────────────────────────────────────────────────
-#[derive(Debug, Serialize, sqlx::FromRow)]
-pub struct Record {
-    pub id: i64,
-    pub session_id: String,
-    pub mem_id: i64,
-    pub role: String,
-    pub content: String,
-    pub tokens_estimated: i64,
-    pub tool_call_id: Option<String>,
-    pub tool_calls: Option<String>,
-    pub created_at: Option<String>,
-    pub parent_mem_id: Option<i64>,
-    pub importance: Option<f64>,
-}
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
 fn get_session_id(args: &serde_json::Value) -> String {
     args["session_id"]
@@ -80,6 +49,7 @@ fn get_session_id(args: &serde_json::Value) -> String {
 
 // ── Database Setup ───────────────────────────────────────────────────────────
 async fn init_db(pool: &SqlitePool) -> Result<()> {
+    // Legacy table — kept for backward compatibility, no longer used by tools
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS agent_history (
@@ -98,129 +68,16 @@ async fn init_db(pool: &SqlitePool) -> Result<()> {
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_session_mem
             ON agent_history(session_id, mem_id);
-        CREATE INDEX IF NOT EXISTS idx_session_created
-            ON agent_history(session_id, created_at DESC);
         "#,
     )
     .execute(pool)
-    .await
-    .context("Failed to create agent_history table")?;
+    .await?;
 
-    info!("Database initialized with improved schema");
+    // New neuro-inspired tables
+    chronesthesia::init_chronesthesia_tables(pool).await?;
+
+    info!("Database initialized: agent_history (legacy) + memory_contents + agent_timeline");
     Ok(())
-}
-
-// ── Core Operations ──────────────────────────────────────────────────────────
-async fn prune_and_write(
-    pool: &SqlitePool,
-    session_id: &str,
-    target_mem_ids: &[i64],
-    memory_note: &str,
-) -> Result<(Vec<Record>, i64)> {
-    let mut tx = pool.begin().await?;
-
-    let tokens_saved: i64 = if target_mem_ids.is_empty() {
-        0
-    } else {
-        let json_ids = serde_json::to_value(target_mem_ids)?;
-
-        let tokens: i64 = sqlx::query_scalar(
-            r#"SELECT COALESCE(SUM(tokens_estimated), 0)
-               FROM agent_history
-               WHERE session_id = ?1 AND mem_id IN (SELECT value FROM json_each(?2))"#,
-        )
-        .bind(session_id)
-        .bind(&json_ids)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        let rows = sqlx::query(
-            r#"DELETE FROM agent_history
-               WHERE session_id = ?1 AND mem_id IN (SELECT value FROM json_each(?2))"#,
-        )
-        .bind(session_id)
-        .bind(&json_ids)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-
-        info!("Pruned {rows} rows in session '{session_id}', saved {tokens} tokens");
-        tokens
-    };
-
-    // Nuevo mem_id
-    let last_mem: Option<i64> =
-        sqlx::query_scalar("SELECT MAX(mem_id) FROM agent_history WHERE session_id = ?1")
-            .bind(session_id)
-            .fetch_one(&mut *tx)
-            .await?;
-
-    let new_mem_id = last_mem.unwrap_or(0) + 1;
-    let tokens_estimated = ((memory_note.len() as f64) / 3.8).ceil() as i64;
-
-    sqlx::query(
-        r#"
-        INSERT INTO agent_history
-        (session_id, mem_id, role, content, tokens_estimated, created_at)
-        VALUES (?1, ?2, 'system', ?3, ?4, ?5)
-        "#,
-    )
-    .bind(session_id)
-    .bind(new_mem_id)
-    .bind(memory_note)
-    .bind(tokens_estimated)
-    .bind(Utc::now().to_rfc3339())
-    .execute(&mut *tx)
-    .await?;
-
-    // Limpieza selectiva de tool_calls huérfanos
-    if !target_mem_ids.is_empty() {
-        sqlx::query("UPDATE agent_history SET tool_calls = NULL WHERE session_id = ?1")
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await?;
-    }
-
-    let remaining: Vec<Record> =
-        sqlx::query_as("SELECT * FROM agent_history WHERE session_id = ?1 ORDER BY mem_id ASC")
-            .bind(session_id)
-            .fetch_all(&mut *tx)
-            .await?;
-
-    tx.commit().await?;
-    Ok((remaining, tokens_saved))
-}
-
-async fn get_history(pool: &SqlitePool, session_id: &str, limit: i64) -> Result<Vec<Record>> {
-    let records = sqlx::query_as(
-        "SELECT * FROM agent_history WHERE session_id = ?1 ORDER BY mem_id DESC LIMIT ?2",
-    )
-    .bind(session_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-    Ok(records)
-}
-
-async fn search_memory(
-    pool: &SqlitePool,
-    session_id: &str,
-    query: &str,
-    limit: i64,
-) -> Result<Vec<Record>> {
-    let pattern = format!("%{}%", query);
-    let records = sqlx::query_as(
-        r#"SELECT * FROM agent_history
-           WHERE session_id = ?1
-             AND content LIKE ?2
-           ORDER BY created_at DESC LIMIT ?3"#,
-    )
-    .bind(session_id)
-    .bind(pattern)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-    Ok(records)
 }
 
 // ── MCP Tool Definitions ─────────────────────────────────────────────────────
@@ -229,20 +86,27 @@ fn tool_definitions() -> serde_json::Value {
         "tools": [
             {
                 "name": "vlk_time_travel",
-                "description": "Emergency memory management. Prunes dead-end memory slots and injects a lesson. Use when stuck in a failure loop or context is cluttered. Every message shows [mem_id:N] — use those exact numbers.",
+                "description": "Chronesthetic memory management. Transitions PRESENT timeline slots to PAST and injects a FUTURE constraint. Use when stuck in a failure loop or context is cluttered. Check vlk_get_history for [timeline:N] IDs.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "session_id": { "type": "string", "description": "Optional. Defaults to 'default'." },
-                        "target_mem_ids": { "type": "array", "items": { "type": "integer" }, "description": "[mem_id:N] numbers to permanently DELETE." },
-                        "learning": { "type": "string", "description": "Concise lesson or condensed facts injected in place of deleted slots." }
+                        "target_timeline_ids": {
+                            "type": "array",
+                            "items": { "type": "integer" },
+                            "description": "Timeline slot IDs (PRESENT) to transition to PAST. Listed in vlk_get_history output."
+                        },
+                        "learning": {
+                            "type": "string",
+                            "description": "Lesson learned — injected as a FUTURE constraint in place of the archived slots."
+                        }
                     },
-                    "required": ["target_mem_ids", "learning"]
+                    "required": ["target_timeline_ids", "learning"]
                 }
             },
             {
                 "name": "vlk_get_history",
-                "description": "Returns memory history for a session. Use to recall past context or verify state.",
+                "description": "Returns the full timeline for a session including temporal state (PRESENT/PAST/FUTURE), content excerpts, and timeline IDs. Use to audit context or find IDs for vlk_time_travel.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -253,7 +117,7 @@ fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "vlk_search_memory",
-                "description": "Search memory by keyword. Useful for retrieving specific facts or decisions.",
+                "description": "Search timeline by keyword across raw logs and learning summaries. Useful for retrieving specific facts, errors, or past decisions.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -266,7 +130,17 @@ fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "vlk_summarize_session",
-                "description": "Returns a condensed textual summary of the current session memory.",
+                "description": "Returns a condensed summary of session memory with counts of PRESENT (active), PAST (archived), and FUTURE (constraint) timeline slots.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string", "description": "Optional. Defaults to 'default'." }
+                    }
+                }
+            },
+            {
+                "name": "vlk_fetch_context",
+                "description": "Returns the clean active context (PRESENT + FUTURE only). Automatically detects and mitigates error loops: if the same error repeats 3+ times, it's archived as PAST and a SYSTEM ANCHOR constraint is injected. Call this before each agent iteration.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -308,7 +182,7 @@ impl AppState {
             "initialize" => ok(serde_json::json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": "Vlk MemAct", "version": "0.3.0" }
+                "serverInfo": { "name": "Vlk MemAct", "version": "0.4.0-chronesthesia" }
             })),
 
             "tools/list" => ok(tool_definitions()),
@@ -319,109 +193,91 @@ impl AppState {
                 let args = &params["arguments"];
 
                 match name {
+                    // ── vlk_time_travel: PRESENT → PAST + FUTURE injection ──
                     "vlk_time_travel" => {
                         let tool_args: TimeTravelArgs = serde_json::from_value(args.clone())
                             .unwrap_or_else(|_| TimeTravelArgs {
                                 session_id: None,
-                                target_mem_ids: vec![],
+                                target_timeline_ids: vec![],
                                 learning: String::new(),
                             });
 
-                        let session_id = tool_args
-                            .session_id
-                            .unwrap_or_else(|| "default".to_string());
-                        let learning = tool_args.learning.trim().to_string();
-
-                        if learning.is_empty() {
-                            return err("Field 'learning' is required and cannot be empty.".into());
-                        }
-
-                        match prune_and_write(
-                            &self.db,
-                            &session_id,
-                            &tool_args.target_mem_ids,
-                            &learning,
-                        )
-                        .await
-                        {
-                            Ok((_, tokens_saved)) => {
+                        match execute_time_travel(&self.db, tool_args).await {
+                            Ok((tokens_saved, learning)) => {
                                 let text = format!(
-                                    "⚠️ [VLK SYSTEM] {} slots pruned, {} tokens saved. Lesson injected:\n---\n{}\n---\nIgnore deleted content. Continue with this clean context.",
-                                    tool_args.target_mem_ids.len(),
-                                    tokens_saved,
-                                    learning
+                                    "🧠 [VLK CHRONESTHESIA] Transitioned timeline slots to PAST (~{} tokens saved). FUTURE constraint injected:\n---\n{}\n---\nThese lessons will be prefixed as [PREVENTIVE FUTURE CONSTRAINT] in subsequent context fetches. Old raw logs are archived and will no longer consume context.",
+                                    tokens_saved, learning
                                 );
                                 ok(serde_json::json!({
                                     "content": [{ "type": "text", "text": text }]
                                 }))
                             }
-                            Err(e) => err(format!("Prune operation failed: {e}")),
+                            Err(e) => err(format!("Time travel failed: {e}")),
                         }
                     }
 
+                    // ── vlk_get_history: full timeline ──
                     "vlk_get_history" => {
-                        let tool_args: GetHistoryArgs =
-                            serde_json::from_value(args.clone()).unwrap_or_default();
                         let session_id = get_session_id(args);
-                        let limit = tool_args.limit.unwrap_or(50);
+                        let limit = args["limit"].as_i64().unwrap_or(50);
 
-                        match get_history(&self.db, &session_id, limit).await {
-                            Ok(records) => ok(serde_json::json!({
-                                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&records).unwrap_or_default() }]
-                            })),
-                            Err(e) => err(format!("Failed to get history: {e}")),
+                        match get_timeline(&self.db, &session_id, limit).await {
+                            Ok(slots) => {
+                                let text = serde_json::to_string_pretty(&slots).unwrap_or_default();
+                                ok(serde_json::json!({
+                                    "content": [{ "type": "text", "text": text }]
+                                }))
+                            }
+                            Err(e) => err(format!("Failed to get timeline: {e}")),
                         }
                     }
 
+                    // ── vlk_search_memory: keyword search ──
                     "vlk_search_memory" => {
-                        let tool_args: SearchMemoryArgs = serde_json::from_value(args.clone())
-                            .unwrap_or_else(|_| SearchMemoryArgs {
-                                session_id: None,
-                                query: String::new(),
-                                limit: None,
-                            });
+                        let session_id = get_session_id(args);
+                        let query_str = args["query"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                        let limit = args["limit"].as_i64().unwrap_or(20);
 
-                        if tool_args.query.trim().is_empty() {
+                        if query_str.is_empty() {
                             return err("Field 'query' is required.".into());
                         }
 
-                        let session_id = get_session_id(args);
-                        let limit = tool_args.limit.unwrap_or(20);
-
-                        match search_memory(&self.db, &session_id, &tool_args.query, limit).await {
-                            Ok(records) => ok(serde_json::json!({
-                                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&records).unwrap_or_default() }]
-                            })),
+                        match search_timeline(&self.db, &session_id, &query_str, limit).await {
+                            Ok(slots) => {
+                                let text = serde_json::to_string_pretty(&slots).unwrap_or_default();
+                                ok(serde_json::json!({
+                                    "content": [{ "type": "text", "text": text }]
+                                }))
+                            }
                             Err(e) => err(format!("Search failed: {e}")),
                         }
                     }
 
+                    // ── vlk_summarize_session: state counts ──
                     "vlk_summarize_session" => {
                         let session_id = get_session_id(args);
 
-                        match get_history(&self.db, &session_id, 100).await {
-                            Ok(records) => {
-                                let total = records.len();
-                                let latest_mem = records.first().map(|r| r.mem_id).unwrap_or(0);
-                                let system_msgs =
-                                    records.iter().filter(|r| r.role == "system").count();
-                                let total_tokens: i64 =
-                                    records.iter().map(|r| r.tokens_estimated).sum();
-
-                                let summary = format!(
-                                    "Session '{}': {} total memories, {} system-injected lessons. Latest mem_id: {}. Estimated tokens: {}. Created at: {}.",
-                                    session_id,
-                                    total,
-                                    system_msgs,
-                                    latest_mem,
-                                    total_tokens,
-                                    records.first().and_then(|r| r.created_at.clone()).unwrap_or_else(|| "unknown".into())
-                                );
-                                ok(serde_json::json!({
-                                    "content": [{ "type": "text", "text": summary }]
-                                }))
-                            }
+                        match get_session_summary(&self.db, &session_id).await {
+                            Ok(summary) => ok(serde_json::json!({
+                                "content": [{ "type": "text", "text": summary }]
+                            })),
                             Err(e) => err(format!("Summarize failed: {e}")),
+                        }
+                    }
+
+                    // ── vlk_fetch_context: clean active context (con interceptor de bucles) ──
+                    "vlk_fetch_context" => {
+                        let session_id = get_session_id(args);
+
+                        match fetch_clean_context(&self.db, &session_id).await {
+                            Ok(ctx) => ok(serde_json::json!({
+                                "content": [{ "type": "text", "text": ctx }]
+                            })),
+                            Err(e) => err(format!("Fetch context failed: {e}")),
                         }
                     }
 
@@ -473,7 +329,7 @@ async fn main() -> Result<()> {
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
 
-    info!("🚀 Vlk MCP Server v0.3.0 ready (stdio)");
+    info!("🚀 Vlk MCP Server v0.4.0-chronesthesia ready (stdio)");
 
     while let Some(line) = stdin.next_line().await? {
         let line = line.trim().to_string();
