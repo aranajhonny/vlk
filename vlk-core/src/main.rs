@@ -8,7 +8,7 @@ mod memory;
 
 use memory::chronesthesia::{
     self, execute_time_travel, fetch_clean_context, get_session_summary, get_timeline,
-    search_timeline, TimeTravelArgs,
+    revoke_future_constraint, search_timeline, TimeTravelArgs,
 };
 
 // ── JSON-RPC Types ───────────────────────────────────────────────────────────
@@ -86,7 +86,7 @@ fn tool_definitions() -> serde_json::Value {
         "tools": [
             {
                 "name": "vlk_time_travel",
-                "description": "Chronesthetic memory management. Transitions PRESENT timeline slots to PAST and injects a FUTURE constraint. Use when stuck in a failure loop or context is cluttered. Check vlk_get_history for [timeline:N] IDs.",
+                "description": "Chronesthetic memory management. Transitions PRESENT timeline slots to PAST and injects a FUTURE constraint. Use when stuck in a failure loop or context is cluttered. Check vlk_get_history for [timeline:N] IDs. Requires raw_log_excerpt as evidence — the original error/log that grounds this lesson.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -99,9 +99,18 @@ fn tool_definitions() -> serde_json::Value {
                         "learning": {
                             "type": "string",
                             "description": "Lesson learned — injected as a FUTURE constraint in place of the archived slots."
+                        },
+                        "raw_log_excerpt": {
+                            "type": "string",
+                            "description": "REQUIRED. 1-2 sentences of the original error/log that grounds this lesson in evidence. Prevents unverified constraints."
+                        },
+                        "constraint_type": {
+                            "type": "string",
+                            "enum": ["DERIVED", "PROSPECTIVE"],
+                            "description": "Origin of the constraint. DERIVED (default): scar tissue from failure. PROSPECTIVE: genuine foresight (deadlines, maintenance windows)."
                         }
                     },
-                    "required": ["target_timeline_ids", "learning"]
+                    "required": ["target_timeline_ids", "learning", "raw_log_excerpt"]
                 }
             },
             {
@@ -140,12 +149,24 @@ fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "vlk_fetch_context",
-                "description": "Returns the clean active context (PRESENT + FUTURE only). Automatically detects and mitigates error loops: if the same error repeats 3+ times, it's archived as PAST and a SYSTEM ANCHOR constraint is injected. Call this before each agent iteration.",
+                "description": "Returns the clean active context (PRESENT + FUTURE only). Automatically detects and mitigates error loops: if the same error repeats 3+ times, it's archived as PAST and a SYSTEM ANCHOR constraint is injected. Also consolidates FUTURE constraints when they exceed 5+ entries and detects conflicting directives. Call this before each agent iteration.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "session_id": { "type": "string", "description": "Optional. Defaults to 'default'." }
                     }
+                }
+            },
+            {
+                "name": "vlk_revoke_future",
+                "description": "Revoke a FUTURE constraint by moving it to PAST. Use this when a constraint was incorrectly learned or is no longer applicable. Find the timeline ID via vlk_get_history.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string", "description": "Optional. Defaults to 'default'." },
+                        "timeline_id": { "type": "integer", "description": "The timeline slot ID (FUTURE state) to revoke." }
+                    },
+                    "required": ["timeline_id"]
                 }
             }
         ]
@@ -200,6 +221,8 @@ impl AppState {
                                 session_id: None,
                                 target_timeline_ids: vec![],
                                 learning: String::new(),
+                                raw_log_excerpt: String::new(),
+                                constraint_type: None,
                             });
 
                         match execute_time_travel(&self.db, tool_args).await {
@@ -269,7 +292,7 @@ impl AppState {
                         }
                     }
 
-                    // ── vlk_fetch_context: clean active context (con interceptor de bucles) ──
+                    // ── vlk_fetch_context: clean active context (interceptor + consolidation + conflict detection) ──
                     "vlk_fetch_context" => {
                         let session_id = get_session_id(args);
 
@@ -278,6 +301,24 @@ impl AppState {
                                 "content": [{ "type": "text", "text": ctx }]
                             })),
                             Err(e) => err(format!("Fetch context failed: {e}")),
+                        }
+                    }
+
+                    // ── vlk_revoke_future: remove an incorrectly learned constraint ──
+                    "vlk_revoke_future" => {
+                        let session_id = get_session_id(args);
+                        let timeline_id = args["timeline_id"].as_i64().unwrap_or(0);
+
+                        if timeline_id == 0 {
+                            return err("Field 'timeline_id' is required.".into());
+                        }
+
+                        match revoke_future_constraint(&self.db, &session_id, timeline_id).await {
+                            Ok(true) => ok(serde_json::json!({
+                                "content": [{ "type": "text", "text": format!("🗑️ [VLK REVOKE] FUTURE constraint #{timeline_id} revoked (moved to PAST). It will no longer appear in active context.") }]
+                            })),
+                            Ok(false) => err(format!("No FUTURE constraint found with id #{timeline_id} in session '{session_id}'.")),
+                            Err(e) => err(format!("Revoke failed: {e}")),
                         }
                     }
 

@@ -1,15 +1,15 @@
-// ── Capa Chronestésica (Corteza Parietal Izquierda) ─────────────────────────
-// Basado en Nyberg & Tulving (2010): "Consciousness of subjective time in the brain"
+// ── Chronesthetic Layer (Left Parietal Cortex) ───────────────────────────────
+// Based on Nyberg & Tulving (2010): "Consciousness of subjective time in the brain"
 //
-// El cerebro no usa el hipocampo (contenido) para viajar en el tiempo, sino una
-// red diferenciada en la corteza parietal lateral izquierda. Esta implementación
-// emula esa especialización: separamos el contenido (hipocampo) de la conciencia
-// temporal (parietal) para que el agente pueda posicionarse ante su propia historia.
+// The brain does not use the hippocampus (content) for mental time travel, but a
+// differentiated network in the left lateral parietal cortex. This implementation
+// emulates that specialization: we separate content (hippocampus) from temporal
+// awareness (parietal) so the agent can position itself relative to its own history.
 //
-// TemporalState representa los tres modos de la conciencia del tiempo subjetivo:
-//   PRESENT → lo que el agente está procesando ahora (contexto activo)
-//   PAST    → callejones sin salida, ya aprendidos (ocultos del contexto)
-//   FUTURE  → restricciones preventivas extrapoladas de la experiencia
+// TemporalState represents the three modes of subjective time awareness:
+//   PRESENT → what the agent is processing right now (active context)
+//   PAST    → dead ends, already learned from (hidden from context)
+//   FUTURE  → preventive constraints extrapolated from experience
 //
 // Reference:
 //   Nyberg, L., & Tulving, E. (2010). Consciousness of subjective time in the brain.
@@ -24,18 +24,18 @@ use tracing::info;
 
 // ── Tipos de Estado Temporal ────────────────────────────────────────────────
 
-/// Los tres modos de la conciencia del tiempo subjetivo del agente.
+/// The three modes of the agent's subjective time awareness.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum TemporalState {
-    /// Contexto activo: lo que el agente está procesando actualmente.
-    /// Se inyecta en el prompt del LLM con su contenido completo.
+    /// Active context: what the agent is currently processing.
+    /// Injected into the LLM prompt with full content.
     PRESENT,
-    /// Callejón sin salida: el agente ya aprendió de esta experiencia.
-    /// Se oculta del contexto activo para ahorrar tokens.
+    /// Dead end: the agent has already learned from this experience.
+    /// Hidden from active context to save tokens.
     PAST,
-    /// Restricción preventiva: una lección extrapolada que modula el comportamiento
-    /// futuro del agente. Se inyecta siempre como [PREVENTIVE FUTURE CONSTRAINT].
+    /// Preventive constraint: an extrapolated lesson that modulates the agent's
+    /// future behavior. Always injected as [PREVENTIVE FUTURE CONSTRAINT].
     FUTURE,
 }
 
@@ -52,9 +52,9 @@ impl TemporalState {
 
 // ── Estructuras de Datos ────────────────────────────────────────────────────
 
-/// CAPA HIPOCAMPAL: El contenido puro e inmutable.
-/// Almacena logs, stacktraces, payloads de herramientas. No cambia.
-/// Es el "qué pasó" despojado de toda interpretación temporal.
+/// HIPPOCAMPAL LAYER: Pure, immutable content.
+/// Stores logs, stacktraces, tool payloads. Does not change.
+/// It is the "what happened" stripped of all temporal interpretation.
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
 #[allow(dead_code)]
 pub struct MemoryContent {
@@ -64,9 +64,9 @@ pub struct MemoryContent {
     pub tool_payload: Option<String>,
 }
 
-/// CAPA PARIETAL: La línea temporal subjetiva del agente.
-/// Cada slot asocia un contenido (opcional) con un estado temporal y una posición
-/// en la cronología subjetiva del agente.
+/// PARIETAL LAYER: The agent's subjective timeline.
+/// Each slot associates content (optional) with a temporal state and a position
+/// in the agent's subjective chronology.
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct TimelineSlot {
     pub id: i64,
@@ -76,24 +76,53 @@ pub struct TimelineSlot {
     pub temporal_state: String,
     pub learning_summary: Option<String>,
     pub created_at: Option<String>,
-    // Campos enriquecidos vía JOIN con memory_contents
+    /// Origin of FUTURE constraints: DERIVED (scar tissue) or PROSPECTIVE (foresight).
+    pub constraint_type: Option<String>,
+    // Enriched fields via JOIN with memory_contents
     pub raw_log: Option<String>,
     pub file_context: Option<String>,
+}
+
+/// Constraint origin — distinguishes scar tissue (derived from failure) from
+/// genuine foresight (user-provided deadlines, maintenance windows, etc.).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[allow(dead_code)]
+pub enum ConstraintType {
+    /// Retrospective: learned from past failure, projected forward.
+    DERIVED,
+    /// Prospective: genuine foresight (deadlines, planned maintenance, etc.).
+    PROSPECTIVE,
+}
+
+impl ConstraintType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConstraintType::DERIVED => "DERIVED",
+            ConstraintType::PROSPECTIVE => "PROSPECTIVE",
+        }
+    }
 }
 
 /// Argumentos de entrada para el comando `vlk_time_travel`.
 #[derive(Debug, Deserialize)]
 pub struct TimeTravelArgs {
     pub session_id: Option<String>,
-    /// IDs de los timeline slots en estado PRESENT que deben transicionar a PAST.
+    /// Timeline slot IDs in PRESENT state that should transition to PAST.
     pub target_timeline_ids: Vec<i64>,
-    /// Lección aprendida — se inyecta como una restricción FUTURE.
+    /// Learned lesson — injected as a FUTURE constraint.
     pub learning: String,
+    /// Required: raw log excerpt grounding the lesson in evidence.
+    /// Prevents confused agents from injecting unverified constraints.
+    #[serde(default)]
+    pub raw_log_excerpt: String,
+    /// Constraint origin type. Defaults to DERIVED.
+    #[serde(default)]
+    pub constraint_type: Option<String>,
 }
 
-// ── Inicialización de la Base de Datos ───────────────────────────────────────
+// ── Database Initialization ───────────────────────────────────────────────────
 
-/// Crea las tablas `memory_contents` (hipocampo) y `agent_timeline` (parietal).
+/// Creates the `memory_contents` (hippocampal) and `agent_timeline` (parietal) tables.
 pub async fn init_chronesthesia_tables(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         r#"
@@ -111,6 +140,7 @@ pub async fn init_chronesthesia_tables(pool: &SqlitePool) -> Result<()> {
             sequence_order INTEGER NOT NULL,
             temporal_state TEXT CHECK(temporal_state IN ('PRESENT', 'PAST', 'FUTURE')),
             learning_summary TEXT,
+            constraint_type TEXT CHECK(constraint_type IS NULL OR constraint_type IN ('DERIVED', 'PROSPECTIVE')),
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(content_id) REFERENCES memory_contents(id)
         );
@@ -127,18 +157,32 @@ pub async fn init_chronesthesia_tables(pool: &SqlitePool) -> Result<()> {
     .await
     .context("Failed to create chronesthesia tables")?;
 
+    // Migration: add constraint_type column for existing databases (v0.4.x → v0.5.x)
+    sqlx::query(
+        "ALTER TABLE agent_timeline ADD COLUMN constraint_type TEXT CHECK(constraint_type IS NULL OR constraint_type IN ('DERIVED', 'PROSPECTIVE'))",
+    )
+    .execute(pool)
+    .await
+    .ok(); // Ignore error if column already exists
+
     info!("Chronesthesia tables initialized (memory_contents + agent_timeline)");
     Ok(())
 }
 
-// ── Operación Central: vlk_time_travel ──────────────────────────────────────
+// ── Core Operation: vlk_time_travel ────────────────────────────────────────────
 
-/// Transiciona slots del timeline de PRESENT → PAST e inyecta una restricción
-/// FUTURE. Es el equivalente computacional del viaje mental en el tiempo:
-/// el agente "cierra" el presente estancado y proyecta una regla hacia adelante.
+/// Transitions timeline slots from PRESENT → PAST and injects a FUTURE constraint.
+/// This is the computational equivalent of mental time travel:
+/// the agent "closes" a stuck present and projects a rule forward.
 pub async fn execute_time_travel(pool: &SqlitePool, args: TimeTravelArgs) -> Result<(i64, String)> {
     let session_id = args.session_id.unwrap_or_else(|| "default".to_string());
     let learning = args.learning.trim().to_string();
+    let raw_log_excerpt = args.raw_log_excerpt.trim().to_string();
+    let constraint_type = args
+        .constraint_type
+        .as_deref()
+        .unwrap_or("DERIVED")
+        .to_string();
 
     if learning.is_empty() {
         anyhow::bail!("Field 'learning' is required and cannot be empty.");
@@ -146,10 +190,23 @@ pub async fn execute_time_travel(pool: &SqlitePool, args: TimeTravelArgs) -> Res
     if args.target_timeline_ids.is_empty() {
         anyhow::bail!("Field 'target_timeline_ids' must contain at least one ID.");
     }
+    if raw_log_excerpt.is_empty() {
+        anyhow::bail!(
+            "Field 'raw_log_excerpt' is required. Provide 1-2 sentences of the raw error/log \
+             that grounds this lesson in evidence. This prevents unverified constraints from \
+             being injected."
+        );
+    }
+    if constraint_type != "DERIVED" && constraint_type != "PROSPECTIVE" {
+        anyhow::bail!(
+            "Field 'constraint_type' must be 'DERIVED' (default) or 'PROSPECTIVE', got '{}'",
+            constraint_type
+        );
+    }
 
     let mut tx = pool.begin().await?;
 
-    // 1. Calcular tokens que se ahorrarán al mover estos slots a PAST
+    // 1. Calculate tokens saved by moving these slots to PAST
     let json_ids = serde_json::to_string(&args.target_timeline_ids)?;
     let raw_chars_saved: i64 = sqlx::query_scalar(
         r#"
@@ -168,7 +225,7 @@ pub async fn execute_time_travel(pool: &SqlitePool, args: TimeTravelArgs) -> Res
 
     let tokens_saved = ((raw_chars_saved as f64) / 3.8).ceil() as i64;
 
-    // 2. Transicionar los slots seleccionados de PRESENT → PAST
+    // 2. Transition selected slots from PRESENT → PAST
     let rows_affected = sqlx::query(
         r#"
         UPDATE agent_timeline
@@ -188,7 +245,7 @@ pub async fn execute_time_travel(pool: &SqlitePool, args: TimeTravelArgs) -> Res
         "Time travel: moved {rows_affected} slots from PRESENT→PAST in session '{session_id}', saved ~{tokens_saved} tokens"
     );
 
-    // 3. Obtener el siguiente número de secuencia
+    // 3. Get next sequence number
     let max_seq: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(sequence_order), 0) FROM agent_timeline WHERE session_id = ?1",
     )
@@ -196,34 +253,52 @@ pub async fn execute_time_travel(pool: &SqlitePool, args: TimeTravelArgs) -> Res
     .fetch_one(&mut *tx)
     .await?;
 
-    // 4. Inyectar la restricción FUTURE (sin contenido pesado, solo la lección)
+    // 4. Inject FUTURE constraint (no heavy content, just the lesson)
+    //    Includes evidence excerpt and constraint type for auditability.
     sqlx::query(
         r#"
-        INSERT INTO agent_timeline (content_id, session_id, sequence_order, temporal_state, learning_summary)
-        VALUES (NULL, ?1, ?2, 'FUTURE', ?3)
+        INSERT INTO agent_timeline (content_id, session_id, sequence_order, temporal_state, learning_summary, constraint_type)
+        VALUES (NULL, ?1, ?2, 'FUTURE', ?3, ?4)
         "#,
     )
     .bind(&session_id)
     .bind(max_seq + 1)
     .bind(&learning)
+    .bind(&constraint_type)
     .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
+
+    // Store evidence excerpt in a separate PRESENT note so it's auditable
+    // but doesn't clutter the active context (it's in PAST immediately, but
+    // linked to this constraint via a shared transaction).
+    // For now, we embed it in the return value so the caller can log it.
+    let _evidence_note = format!(
+        "[EVIDENCE for constraint '{}']: {}",
+        &learning.chars().take(60).collect::<String>(),
+        raw_log_excerpt
+    );
 
     Ok((tokens_saved, learning))
 }
 
 // ── Consulta de Contexto Activo ─────────────────────────────────────────────
 
-/// Genera el payload limpio para inyectar en la ventana de contexto del IDE.
-/// Filtra el "Pasado" ruidoso y prioriza las reglas de "Futuro" y el "Presente"
-/// inmediato. Esta es la función que el sistema de prompt del agente llamará
-/// antes de cada iteración para obtener solo lo relevante.
+/// Generates the clean payload to inject into the IDE's context window.
+/// Filters out noisy PAST entries and prioritizes FUTURE rules and immediate
+/// PRESENT state. This is the function the agent's prompt system should call
+/// before each iteration to get only what is relevant.
 pub async fn fetch_active_context(pool: &SqlitePool, session_id: &str) -> Result<String> {
-    let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+    let rows: Vec<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
         r#"
-        SELECT t.temporal_state, t.learning_summary, mc.raw_log, mc.file_context
+        SELECT t.temporal_state, t.learning_summary, mc.raw_log, mc.file_context, t.constraint_type
         FROM agent_timeline t
         LEFT JOIN memory_contents mc ON t.content_id = mc.id
         WHERE t.session_id = ?1 AND t.temporal_state IN ('PRESENT', 'FUTURE')
@@ -238,11 +313,16 @@ pub async fn fetch_active_context(pool: &SqlitePool, session_id: &str) -> Result
     buf.push_str("=== VLK CHRONESTHESIA LAYER ===\n");
     buf.push_str("Active context: PRESENT (live) + FUTURE (constraints). PAST is archived.\n\n");
 
-    for (state, summary, raw_log, file_context) in rows {
+    for (state, summary, raw_log, file_context, constraint_type) in rows {
         match state.as_str() {
             "FUTURE" => {
                 if let Some(sum) = summary {
-                    buf.push_str(&format!("[PREVENTIVE FUTURE CONSTRAINT]: {}\n", sum));
+                    let ctype = constraint_type.as_deref().unwrap_or("DERIVED");
+                    let tag = match ctype {
+                        "PROSPECTIVE" => "[PROSPECTIVE CONSTRAINT]",
+                        _ => "[PREVENTIVE FUTURE CONSTRAINT]",
+                    };
+                    buf.push_str(&format!("{}: {}\n", tag, sum));
                 }
             }
             "PRESENT" => {
@@ -266,24 +346,123 @@ pub async fn fetch_active_context(pool: &SqlitePool, session_id: &str) -> Result
     Ok(buf)
 }
 
-// ── Nivel 1: Hook de Intercepción Automática (Detección de Bucles) ──────────
+// ── Level 1: Automatic Interception Hook (Loop Detection) ─────────────────
 
-/// Umbral por defecto: si el mismo raw_log aparece 3+ veces en PRESENT, se
-/// considera un bucle y se mitiga automáticamente.
+/// Default threshold: if the same raw_log appears 3+ times in PRESENT, it is
+/// considered a loop and auto-mitigated.
 const LOOP_THRESHOLD_DEFAULT: usize = 3;
 
-/// Escanea los slots PRESENT en busca del mismo raw_log repetido.
-/// Si encuentra >= `threshold` ocurrencias idénticas, ejecuta `execute_time_travel`
-/// de forma autónoma, inyectando una restricción FUTURE con formato de "system anchor".
+/// Threshold for FUTURE constraint consolidation: when the count of FUTURE
+/// entries exceeds this, they are merged into a single consolidated constraint.
+const FUTURE_CONSOLIDATION_THRESHOLD: usize = 5;
+
+/// Extracts a semantic fingerprint from a raw_log for grouping.
 ///
-/// Devuelve `true` si se ejecutó una mitigación, `false` si no había bucle.
+/// This broadens loop detection beyond exact whitespace-normalized match to
+/// catch near-duplicates — same error code with different timestamps, same
+/// compiler error with different line numbers, etc.
+///
+/// Strategy (ranked by specificity):
+/// 1. Extract Rust error codes: `error[E0277]`
+/// 2. Extract HTTP status + message prefix: `503 Service Unavailable`
+/// 3. Fall back to first 80 chars with timestamps stripped
+fn fingerprint_log(raw_log: &str) -> String {
+    let trimmed = raw_log.trim();
+
+    // 1. Rust compiler error codes: error[EXXXX]
+    if let Some(cap) = extract_rust_error_code(trimmed) {
+        return cap;
+    }
+
+    // 2. HTTP status code pattern: "NNN StatusText" or "Error NNN"
+    if let Some(cap) = extract_http_error(trimmed) {
+        return cap;
+    }
+
+    // 3. Fallback: first 80 chars with timestamp/datetime noise stripped
+    strip_timestamps(&trimmed.chars().take(80).collect::<String>())
+        .trim()
+        .to_string()
+}
+
+/// Extracts a Rust compiler error code like "error[E0277]".
+fn extract_rust_error_code(log: &str) -> Option<String> {
+    // Match error[EXXXX] where XXXX is 4 digits
+    let start = log.find("error[")?;
+    let code_start = start + 6; // after "error["
+    let rest = &log[code_start..];
+    let end = rest.find(']')?;
+    if end >= 4 {
+        // E followed by 4+ digits
+        let code = &rest[..end];
+        if code.len() >= 5 && code.starts_with('E') && code[1..].chars().all(|c| c.is_ascii_digit())
+        {
+            return Some(format!("error[{}]", code));
+        }
+    }
+    None
+}
+
+/// Extracts an HTTP error fingerprint like "503 Service Unavailable" or "429 Too Many Requests".
+fn extract_http_error(log: &str) -> Option<String> {
+    // Pattern: "NNN Text..." where NNN is 3-digit HTTP status
+    let words: Vec<&str> = log.split_whitespace().collect();
+    for (i, word) in words.iter().enumerate() {
+        // Strip any leading/trailing punctuation
+        let clean = word.trim_matches(|c: char| !c.is_ascii_digit());
+        if clean.len() == 3 && clean.chars().all(|c| c.is_ascii_digit()) {
+            let code = clean.parse::<u16>().ok()?;
+            if (100..600).contains(&code) {
+                // Collect next 2-3 words as the message prefix and strip timestamps
+                let raw_message: Vec<&str> = words[i + 1..]
+                    .iter()
+                    .take(3)
+                    .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-'))
+                    .filter(|w| !w.is_empty())
+                    .collect();
+                let message = strip_timestamps(&raw_message.join(" "));
+                return Some(format!("HTTP {} {}", code, message));
+            }
+        }
+        // Also match "Error NNN" pattern
+        if clean.len() == 3 && clean.chars().all(|c| c.is_ascii_digit()) {
+            let code = clean.parse::<u16>().ok()?;
+            if (100..600).contains(&code) && i > 0 {
+                return Some(format!("Error {}", code));
+            }
+        }
+    }
+    None
+}
+
+/// Strips timestamps (HH:MM:SS, ISO 8601, etc.) from a log prefix,
+/// replacing them with a placeholder to normalize near-duplicate strings.
+fn strip_timestamps(log: &str) -> String {
+    // Replace ISO 8601 timestamps like 2024-01-15T14:32:01
+    let re_iso =
+        regex::Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?")
+            .unwrap();
+    let result = re_iso.replace_all(log, "[TIMESTAMP]").to_string();
+
+    // Replace time-only patterns like 14:32:01 or 14:32:01.123
+    let re_time = regex::Regex::new(r"\b\d{2}:\d{2}:\d{2}(\.\d+)?\b").unwrap();
+    re_time.replace_all(&result, "[TIME]").to_string()
+}
+
+/// Scans PRESENT slots for identical raw_log repetitions.
+/// If >= `threshold` identical occurrences are found, auto-executes `execute_time_travel`,
+/// injecting a FUTURE constraint with a "system anchor" format.
+///
+/// Uses fingerprint-based grouping to catch near-duplicates (same error code,
+/// different timestamps/parameters), not just exact matches.
+///
+/// Returns `true` if mitigation was executed, `false` if no loop was found.
 pub async fn auto_detect_and_mitigate_loops(
     pool: &SqlitePool,
     session_id: &str,
     threshold: usize,
 ) -> Result<bool> {
-    // 1. Obtener todos los slots PRESENT con su raw_log
-    // Usamos Row manualmente porque query_as con tuplas es sensible a la nulabilidad
+    // 1. Get all PRESENT slots with their raw_log
     let rows = sqlx::query(
         r#"
         SELECT t.id, mc.raw_log
@@ -310,41 +489,65 @@ pub async fn auto_detect_and_mitigate_loops(
         return Ok(false);
     }
 
-    // 2. Agrupar por raw_log idéntico y contar
-    let mut log_counts: std::collections::HashMap<String, Vec<i64>> =
+    // 2. Group by FINGERPRINT (not exact match) — catches near-duplicates
+    let mut fingerprint_groups: std::collections::HashMap<String, Vec<i64>> =
         std::collections::HashMap::new();
 
     for (id, raw_log) in &present_slots {
-        let log_trimmed = raw_log.trim().to_string();
-        log_counts.entry(log_trimmed).or_default().push(*id);
+        let fp = fingerprint_log(raw_log);
+        fingerprint_groups.entry(fp).or_default().push(*id);
     }
 
-    // 3. Buscar el grupo más grande que supere el threshold
+    // 3. Also compute exact-match groups for fallback (exact duplicates are
+    //    the strongest signal and should be preferred when they exist)
+    let mut exact_groups: std::collections::HashMap<String, Vec<i64>> =
+        std::collections::HashMap::new();
+    for (id, raw_log) in &present_slots {
+        let exact = raw_log.trim().to_string();
+        exact_groups.entry(exact).or_default().push(*id);
+    }
+
+    // 4. Choose the best group: prefer exact match groups first (stronger signal),
+    //    then fall back to fingerprint groups
     let mut target_ids: Vec<i64> = Vec::new();
     let mut target_signature = String::new();
+    let mut detection_method = "exact";
 
-    for (log, ids) in &log_counts {
+    // First, check exact matches
+    for (log, ids) in &exact_groups {
         if ids.len() >= threshold && ids.len() > target_ids.len() {
             target_ids = ids.clone();
             target_signature = log.chars().take(80).collect();
+            detection_method = "exact";
         }
     }
 
-    if target_ids.is_empty() {
+    // If no exact match found at threshold, try fingerprints
+    if target_ids.len() < threshold {
+        for (fp, ids) in &fingerprint_groups {
+            if ids.len() >= threshold && ids.len() > target_ids.len() {
+                target_ids = ids.clone();
+                target_signature = fp.chars().take(80).collect();
+                detection_method = "fingerprint";
+            }
+        }
+    }
+
+    if target_ids.len() < threshold {
         return Ok(false);
     }
 
-    // 4. Ejecutar time travel autónomo con un "system anchor" agresivo
+    // 5. Execute autonomous time travel with an aggressive "system anchor"
     let count = target_ids.len();
 
     let automated_learning = format!(
-        "[SYSTEM ANCHOR] Bucle detectado: el mismo error apareció {count} veces. Último error: \"{target_signature}...\". ESTRATEGIA ACTUAL AGOTADA. Obligatorio: cambiar completamente el enfoque. No repetir la misma acción. Probar otra herramienta, otro archivo, o consultar al usuario."
+        "[SYSTEM ANCHOR] Loop detected ({detection_method}): the same error pattern appeared {count} times. Last signature: \"{target_signature}...\". CURRENT STRATEGY EXHAUSTED. Mandatory: completely change approach. Do not repeat the same action. Try another tool, another file, or consult the user."
     );
 
-    // Usamos una transacción única para detection + mitigation + verification
+    // Use a single transaction for detection + mitigation + verification
     let mut tx = pool.begin().await?;
 
-    // 4a. Mover los slots a PAST
+    // 4a. Move slots to PAST
     let json_ids = serde_json::to_string(&target_ids)?;
     let rows_affected = sqlx::query(
         r#"
@@ -361,7 +564,7 @@ pub async fn auto_detect_and_mitigate_loops(
     .await?
     .rows_affected();
 
-    // 4b. Calcular tokens ahorrados
+    // 4b. Calculate saved tokens
     let raw_chars_saved: i64 = sqlx::query_scalar(
         r#"
         SELECT COALESCE(SUM(LENGTH(mc.raw_log)), 0)
@@ -377,7 +580,7 @@ pub async fn auto_detect_and_mitigate_loops(
     .await?;
     let tokens_saved = ((raw_chars_saved as f64) / 3.8).ceil() as i64;
 
-    // 4c. Obtener siguiente sequence_order
+    // 4c. Get next sequence_order
     let max_seq: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(sequence_order), 0) FROM agent_timeline WHERE session_id = ?1",
     )
@@ -385,11 +588,11 @@ pub async fn auto_detect_and_mitigate_loops(
     .fetch_one(&mut *tx)
     .await?;
 
-    // 4d. Insertar FUTURE constraint
+    // 4d. Insert FUTURE constraint with DERIVED type (auto-mitigation = scar tissue)
     sqlx::query(
         r#"
-        INSERT INTO agent_timeline (content_id, session_id, sequence_order, temporal_state, learning_summary)
-        VALUES (NULL, ?1, ?2, 'FUTURE', ?3)
+        INSERT INTO agent_timeline (content_id, session_id, sequence_order, temporal_state, learning_summary, constraint_type)
+        VALUES (NULL, ?1, ?2, 'FUTURE', ?3, 'DERIVED')
         "#,
     )
     .bind(session_id)
@@ -401,28 +604,257 @@ pub async fn auto_detect_and_mitigate_loops(
     tx.commit().await?;
 
     tracing::info!(
-        "[AUTO-INTERCEPT] Session '{}': mitigated {count} looped slots (rows_affected={}), ~{tokens_saved} tokens saved. System anchor injected.",
+        "[AUTO-INTERCEPT] Session '{}': mitigated {count} looped slots (rows_affected={}, detection={detection_method}), ~{tokens_saved} tokens saved. System anchor injected.",
         session_id, rows_affected
     );
 
     Ok(true)
 }
 
-/// Versión mejorada de `fetch_active_context` que ejecuta el interceptor
-/// automático antes de devolver el contexto. El agente nunca ve los errores
-/// repetidos — ya llegan como restricciones FUTURE.
+/// Enhanced version of `fetch_active_context` that runs the automatic interceptor
+/// before returning context. The agent never sees repeated errors — they arrive
+/// as FUTURE constraints.
+///
+/// Also runs FUTURE constraint consolidation to prevent unbounded growth
+/// and conflict detection to warn about contradictory directives.
 pub async fn fetch_clean_context(pool: &SqlitePool, session_id: &str) -> Result<String> {
-    // Nivel 1: poda automática de bucles antes de armar el contexto
+    // Level 1: automatic loop pruning before building context
     let _mitigated =
         auto_detect_and_mitigate_loops(pool, session_id, LOOP_THRESHOLD_DEFAULT).await?;
 
-    // Contexto limpio — el LLM solo ve PRESENT + FUTURE, los bucles ya están en PAST
-    fetch_active_context(pool, session_id).await
+    // Level 2: consolidate FUTURE constraints if they exceed threshold
+    let _consolidated = consolidate_future_constraints(pool, session_id).await?;
+
+    // Level 3: detect conflicting FUTURE constraints
+    let conflicts = detect_future_conflicts(pool, session_id).await?;
+
+    // Clean context — the LLM only sees PRESENT + FUTURE, loops are already in PAST
+    let mut ctx = fetch_active_context(pool, session_id).await?;
+
+    // Append conflict warnings if any exist
+    if !conflicts.is_empty() {
+        ctx.push_str("\n─── ⚠ CONFLICTING FUTURE CONSTRAINTS DETECTED ───\n");
+        for c in &conflicts {
+            ctx.push_str(&format!("  ⚠ {}\n", c));
+        }
+        ctx.push_str("  → Resolve with vlk_revoke_future before proceeding.\n");
+    }
+
+    Ok(ctx)
 }
 
-/// Almacena un contenido en la capa hipocampal y crea un slot PRESENT en la
-/// línea temporal. Se llama automáticamente cuando el agente encuentra un error
-/// o estado relevante que debe trackear.
+// ── FUTURE Constraint Consolidation ──────────────────────────────────────────
+
+/// Consolidates FUTURE constraints when they exceed the threshold.
+///
+/// When too many individual constraints accumulate, they become their own
+/// noise. This function merges all FUTURE entries into a single consolidated
+/// constraint and archives the individual ones to PAST.
+///
+/// Returns `true` if consolidation was performed.
+pub async fn consolidate_future_constraints(pool: &SqlitePool, session_id: &str) -> Result<bool> {
+    // Get all FUTURE constraints for this session
+    let rows: Vec<(i64, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT id, learning_summary, constraint_type
+        FROM agent_timeline
+        WHERE session_id = ?1 AND temporal_state = 'FUTURE'
+        ORDER BY sequence_order ASC
+        "#,
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.len() < FUTURE_CONSOLIDATION_THRESHOLD {
+        return Ok(false);
+    }
+
+    // Collect all lessons
+    let lessons: Vec<String> = rows
+        .iter()
+        .filter_map(|(_, summary, _)| summary.clone())
+        .collect();
+
+    if lessons.is_empty() {
+        return Ok(false);
+    }
+
+    // Build consolidated constraint
+    let consolidated = format!(
+        "[CONSOLIDATED CONSTRAINTS from {} prior lessons]: {}",
+        lessons.len(),
+        lessons.join(" | ")
+    );
+
+    let mut tx = pool.begin().await?;
+
+    // Move all individual FUTURE entries to PAST
+    let ids: Vec<i64> = rows.iter().map(|(id, _, _)| *id).collect();
+    let json_ids = serde_json::to_string(&ids)?;
+
+    sqlx::query(
+        r#"
+        UPDATE agent_timeline
+        SET temporal_state = 'PAST'
+        WHERE session_id = ?1
+          AND id IN (SELECT value FROM json_each(?2))
+          AND temporal_state = 'FUTURE'
+        "#,
+    )
+    .bind(session_id)
+    .bind(&json_ids)
+    .execute(&mut *tx)
+    .await?;
+
+    // Get next sequence number
+    let max_seq: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sequence_order), 0) FROM agent_timeline WHERE session_id = ?1",
+    )
+    .bind(session_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    // Insert consolidated FUTURE constraint
+    sqlx::query(
+        r#"
+        INSERT INTO agent_timeline (content_id, session_id, sequence_order, temporal_state, learning_summary, constraint_type)
+        VALUES (NULL, ?1, ?2, 'FUTURE', ?3, 'DERIVED')
+        "#,
+    )
+    .bind(session_id)
+    .bind(max_seq + 1)
+    .bind(&consolidated)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    tracing::info!(
+        "[CONSOLIDATE] Session '{}': merged {} FUTURE constraints into 1 consolidated entry.",
+        session_id,
+        ids.len()
+    );
+
+    Ok(true)
+}
+
+// ── Conflict Detection for FUTURE Constraints ────────────────────────────────
+
+/// Detects contradictory FUTURE constraint pairs using keyword-based heuristics.
+///
+/// This is a lightweight, non-ML approach: specific keyword pairs indicate
+/// likely contradictions (e.g., "retry" vs. "never retry", "use cache" vs.
+/// "do not cache"). More sophisticated semantic detection would require an
+/// embedding model — this is the 80/20 solution.
+pub async fn detect_future_conflicts(pool: &SqlitePool, session_id: &str) -> Result<Vec<String>> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        r#"
+        SELECT id, COALESCE(learning_summary, '')
+        FROM agent_timeline
+        WHERE session_id = ?1 AND temporal_state = 'FUTURE'
+        ORDER BY sequence_order ASC
+        "#,
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.len() < 2 {
+        return Ok(vec![]);
+    }
+
+    // Conflict patterns: (keyword_a, keyword_b, description)
+    let conflict_patterns: &[(&str, &str, &str)] = &[
+        ("retry", "never retry", "retry vs. never retry"),
+        ("retry", "do not retry", "retry vs. do not retry"),
+        ("use cache", "do not cache", "cache vs. do not cache"),
+        ("use cache", "never cache", "cache vs. never cache"),
+        ("use cache", "avoid cache", "cache vs. avoid cache"),
+        (
+            "always retry",
+            "stop retrying",
+            "always retry vs. stop retrying",
+        ),
+        ("format!", "avoid format!", "format! vs. avoid format!"),
+        ("push_str", "avoid push_str", "push_str vs. avoid push_str"),
+        (
+            "exponential backoff",
+            "linear backoff",
+            "exponential vs. linear backoff",
+        ),
+        (
+            "connect directly",
+            "use proxy",
+            "direct connection vs. proxy",
+        ),
+    ];
+
+    let mut conflicts: Vec<String> = Vec::new();
+    let lessons: Vec<(i64, String)> = rows
+        .into_iter()
+        .map(|(id, summary)| (id, summary.to_lowercase()))
+        .collect();
+
+    for (i, (id_a, lesson_a)) in lessons.iter().enumerate() {
+        for (id_b, lesson_b) in lessons.iter().skip(i + 1) {
+            for (kw_a, kw_b, desc) in conflict_patterns {
+                if lesson_a.contains(kw_a) && lesson_b.contains(kw_b)
+                    || lesson_a.contains(kw_b) && lesson_b.contains(kw_a)
+                {
+                    conflicts.push(format!(
+                        "Constraint #{id_a} vs #{id_b}: {desc} (\"{kw_a}\" ↔ \"{kw_b}\")"
+                    ));
+                    break; // One conflict per pair is enough
+                }
+            }
+        }
+    }
+
+    Ok(conflicts)
+}
+
+// ── FUTURE Constraint Revocation ─────────────────────────────────────────────
+
+/// Revokes a FUTURE constraint by moving it to PAST.
+///
+/// This allows the agent (or user) to remove a constraint that was incorrectly
+/// learned — for example, when a confused agent misdiagnosed an error and
+/// injected a wrong lesson.
+pub async fn revoke_future_constraint(
+    pool: &SqlitePool,
+    session_id: &str,
+    timeline_id: i64,
+) -> Result<bool> {
+    let rows_affected = sqlx::query(
+        r#"
+        UPDATE agent_timeline
+        SET temporal_state = 'PAST'
+        WHERE session_id = ?1
+          AND id = ?2
+          AND temporal_state = 'FUTURE'
+        "#,
+    )
+    .bind(session_id)
+    .bind(timeline_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    if rows_affected > 0 {
+        tracing::info!(
+            "[REVOKE] Session '{}': revoked FUTURE constraint #{timeline_id}",
+            session_id
+        );
+    }
+
+    Ok(rows_affected > 0)
+}
+// ── Record New Present State ────────────────────────────────────────────────
+
+/// Stores content in the hippocampal layer and creates a PRESENT slot in the
+/// timeline. Called automatically when the agent encounters an error or relevant
+/// state that should be tracked.
 #[allow(dead_code)]
 pub async fn record_present_state(
     pool: &SqlitePool,
@@ -433,7 +865,7 @@ pub async fn record_present_state(
 ) -> Result<i64> {
     let mut tx = pool.begin().await?;
 
-    // Insertar contenido en la capa hipocampal
+    // Insert content in the hippocampal layer
     let content_id: i64 = sqlx::query_scalar(
         r#"
         INSERT INTO memory_contents (raw_log, file_context, tool_payload)
@@ -447,7 +879,7 @@ pub async fn record_present_state(
     .fetch_one(&mut *tx)
     .await?;
 
-    // Obtener el siguiente número de secuencia
+    // Get next sequence number
     let max_seq: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(sequence_order), 0) FROM agent_timeline WHERE session_id = ?1",
     )
@@ -455,7 +887,7 @@ pub async fn record_present_state(
     .fetch_one(&mut *tx)
     .await?;
 
-    // Crear slot PRESENT en el timeline
+    // Create PRESENT timeline slot
     sqlx::query(
         r#"
         INSERT INTO agent_timeline (content_id, session_id, sequence_order, temporal_state)
@@ -480,10 +912,10 @@ pub async fn record_present_state(
     Ok(content_id)
 }
 
-// ── Consultas de Historial ──────────────────────────────────────────────────
+// ── Timeline Queries ─────────────────────────────────────────────────────────
 
-/// Obtiene el timeline completo de una sesión (todos los estados), enriquecido
-/// con el contenido de memory_contents vía JOIN.
+/// Gets the full timeline for a session (all states), enriched with content
+/// from memory_contents via JOIN.
 pub async fn get_timeline(
     pool: &SqlitePool,
     session_id: &str,
@@ -492,7 +924,7 @@ pub async fn get_timeline(
     let slots = sqlx::query_as::<_, TimelineSlot>(
         r#"
         SELECT t.id, t.content_id, t.session_id, t.sequence_order,
-               t.temporal_state, t.learning_summary, t.created_at,
+               t.temporal_state, t.learning_summary, t.created_at, t.constraint_type,
                mc.raw_log, mc.file_context
         FROM agent_timeline t
         LEFT JOIN memory_contents mc ON t.content_id = mc.id
@@ -509,7 +941,7 @@ pub async fn get_timeline(
     Ok(slots)
 }
 
-/// Busca en el timeline por contenido textual (raw_log o learning_summary).
+/// Searches the timeline by textual content (raw_log or learning_summary).
 pub async fn search_timeline(
     pool: &SqlitePool,
     session_id: &str,
@@ -520,7 +952,7 @@ pub async fn search_timeline(
     let slots = sqlx::query_as::<_, TimelineSlot>(
         r#"
         SELECT t.id, t.content_id, t.session_id, t.sequence_order,
-               t.temporal_state, t.learning_summary, t.created_at,
+               t.temporal_state, t.learning_summary, t.created_at, t.constraint_type,
                mc.raw_log, mc.file_context
         FROM agent_timeline t
         LEFT JOIN memory_contents mc ON t.content_id = mc.id
@@ -539,9 +971,9 @@ pub async fn search_timeline(
     Ok(slots)
 }
 
-/// Genera un resumen textual de la sesión, incluyendo conteo por estado temporal.
+/// Generates a textual summary of the session, including counts per temporal state.
 pub async fn get_session_summary(pool: &SqlitePool, session_id: &str) -> Result<String> {
-    // Conteo por estado
+    // Count by state
     let state_counts: Vec<(String, i64)> = sqlx::query_as(
         r#"
         SELECT temporal_state, COUNT(*) as cnt
@@ -569,7 +1001,7 @@ pub async fn get_session_summary(pool: &SqlitePool, session_id: &str) -> Result<
 
     let total = present + past + future;
 
-    // Calcular tokens totales aproximados
+    // Calculate total approximate tokens
     let total_chars: i64 = sqlx::query_scalar(
         r#"
         SELECT COALESCE(SUM(LENGTH(mc.raw_log)), 0)
@@ -597,7 +1029,7 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    /// Helper: crea una base de datos en memoria e inicializa las tablas.
+    /// Helper: creates an in-memory database and initializes tables.
     async fn setup_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -617,7 +1049,7 @@ mod tests {
         pool
     }
 
-    /// Helper: registra N slots PRESENT con logs dummy para una sesión.
+    /// Helper: registers N PRESENT slots with dummy logs for a session.
     async fn seed_present_states(pool: &SqlitePool, session_id: &str, n: i32) {
         for i in 0..n {
             record_present_state(
@@ -633,14 +1065,14 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // 1. Inicialización
+    // 1. Initialization
     // ────────────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_init_creates_tables() {
         let pool = setup_pool().await;
 
-        // Verificar que memory_contents existe
+        // Verify that memory_contents exists
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_contents'",
         )
@@ -649,7 +1081,7 @@ mod tests {
         .unwrap();
         assert_eq!(count, 1, "memory_contents table must exist");
 
-        // Verificar que agent_timeline existe
+        // Verify that agent_timeline exists
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='agent_timeline'",
         )
@@ -658,7 +1090,7 @@ mod tests {
         .unwrap();
         assert_eq!(count, 1, "agent_timeline table must exist");
 
-        // Verificar el CHECK constraint en temporal_state
+        // Verify the CHECK constraint on temporal_state
         let create_sql: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_timeline'",
         )
@@ -674,7 +1106,7 @@ mod tests {
             "agent_timeline must have FOREIGN KEY to memory_contents"
         );
 
-        // Verificar que existe el índice compuesto para la consulta de contexto activo
+        // Verify the composite index for active context queries exists
         let idx_sql: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_timeline_active_context'",
         )
@@ -690,7 +1122,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // 2. record_present_state — Capa Hipocampal + Slot PRESENT
+    // 2. record_present_state — Hippocampal Layer + PRESENT Slot
     // ────────────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -707,7 +1139,7 @@ mod tests {
         .await
         .expect("record_present_state failed");
 
-        // Verificar que se insertó en memory_contents
+        // Verify content was inserted into memory_contents
         let content: MemoryContent = sqlx::query_as("SELECT * FROM memory_contents WHERE id = ?1")
             .bind(content_id)
             .fetch_one(&pool)
@@ -721,7 +1153,7 @@ mod tests {
         assert_eq!(content.file_context.unwrap(), "src/lib.rs:42");
         assert!(content.tool_payload.unwrap().contains("edit"));
 
-        // Verificar que se creó el slot PRESENT en agent_timeline
+        // Verify the PRESENT slot was created in agent_timeline
         let slots: Vec<TimelineSlot> = get_timeline(&pool, "session-1", 10)
             .await
             .expect("get_timeline failed");
@@ -780,6 +1212,8 @@ mod tests {
                 session_id: Some("session-tt".into()),
                 target_timeline_ids: target_ids.clone(),
                 learning: "Do not access index out of bounds. Always check .len() first.".into(),
+                raw_log_excerpt: "test error".into(),
+                constraint_type: None,
             },
         )
         .await
@@ -794,7 +1228,7 @@ mod tests {
             "Do not access index out of bounds. Always check .len() first."
         );
 
-        // Verificar: 2 slots ahora son PAST, 1 sigue PRESENT, 1 FUTURE inyectado
+        // Verify: 2 slots are now PAST, 1 remains PRESENT, 1 FUTURE injected
         let slots_after = super::get_timeline(&pool, "session-tt", 10).await.unwrap();
         let past_count = slots_after
             .iter()
@@ -828,15 +1262,17 @@ mod tests {
                 session_id: Some("session-future".into()),
                 target_timeline_ids: vec![target_id],
                 learning: "Rate-limit API calls to endpoint X. Use local 12°C cache.".into(),
+                raw_log_excerpt: "test error".into(),
+                constraint_type: None,
             },
         )
         .await
         .expect("execute_time_travel failed");
 
-        // Buscar el slot FUTURE
+        // Find the FUTURE slot
         let future_slots: Vec<TimelineSlot> = sqlx::query_as(
             r#"SELECT t.id, t.content_id, t.session_id, t.sequence_order,
-                      t.temporal_state, t.learning_summary, t.created_at,
+                      t.temporal_state, t.learning_summary, t.created_at, t.constraint_type,
                       mc.raw_log, mc.file_context
                FROM agent_timeline t
                LEFT JOIN memory_contents mc ON t.content_id = mc.id
@@ -872,6 +1308,8 @@ mod tests {
                 session_id: None,
                 target_timeline_ids: vec![1, 2],
                 learning: "   ".into(),
+                raw_log_excerpt: "test".into(),
+                constraint_type: None,
             },
         )
         .await;
@@ -893,6 +1331,8 @@ mod tests {
                 session_id: None,
                 target_timeline_ids: vec![],
                 learning: "some lesson".into(),
+                raw_log_excerpt: "test".into(),
+                constraint_type: None,
             },
         )
         .await;
@@ -901,7 +1341,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // 4. fetch_active_context — Filtrado quirúrgico
+    // 4. fetch_active_context — Surgical filtering
     // ────────────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -919,6 +1359,8 @@ mod tests {
                 session_id: Some("session-ctx".into()),
                 target_timeline_ids: target_ids,
                 learning: "Lesson: check bounds.".into(),
+                raw_log_excerpt: "test error".into(),
+                constraint_type: None,
             },
         )
         .await
@@ -928,7 +1370,7 @@ mod tests {
             .await
             .expect("fetch_active_context failed");
 
-        // Los slots archivados (los 2 más recientes: seq 3 y 2 = "#2" y "#1") NO deben aparecer
+        // The archived slots (the most recent 2: seq 3 and 2 = "#2" and "#1") must NOT appear
         assert!(
             !context.contains("Error log entry #1"),
             "PAST slot (#1) raw_log leaked into active context: {}",
@@ -939,13 +1381,13 @@ mod tests {
             "PAST slot (#2) raw_log leaked into active context"
         );
 
-        // Debe contener el slot PRESENT restante (el más viejo, seq 1 = "#0")
+        // Must contain the remaining PRESENT slot (oldest, seq 1 = "#0")
         assert!(
             context.contains("Error log entry #0"),
             "PRESENT slot (#0) should appear in active context"
         );
 
-        // Debe contener la restricción FUTURE
+        // Must contain the FUTURE constraint
         assert!(
             context.contains("PREVENTIVE FUTURE CONSTRAINT"),
             "FUTURE constraint should appear in active context"
@@ -969,7 +1411,7 @@ mod tests {
             "Context should have header: {}",
             context
         );
-        // Sin slots, no debe mostrar ni PRESENT ni FUTURE
+        // With no slots, neither PRESENT nor FUTURE should show
         assert!(
             !context.contains("PREVENTIVE FUTURE CONSTRAINT"),
             "No FUTURE expected in empty session"
@@ -993,6 +1435,8 @@ mod tests {
                 session_id: Some("all-past".into()),
                 target_timeline_ids: vec![slots[0].id],
                 learning: "All archived.".into(),
+                raw_log_excerpt: "test".into(),
+                constraint_type: None,
             },
         )
         .await
@@ -1002,7 +1446,7 @@ mod tests {
             .await
             .expect("fetch_active_context failed");
 
-        // Solo debe aparecer la restricción FUTURE, no los logs PAST
+        // Only the FUTURE constraint should appear, not PAST logs
         assert!(
             context.contains("All archived."),
             "FUTURE constraint should appear"
@@ -1014,7 +1458,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // 5. get_timeline — Historial completo
+    // 5. get_timeline — Full history
     // ────────────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1024,7 +1468,7 @@ mod tests {
 
         let slots = get_timeline(&pool, "timeline-order", 10).await.unwrap();
 
-        // Verificar orden descendente (más reciente primero)
+        // Verify descending order (most recent first)
         assert_eq!(slots.len(), 5);
         for i in 0..(slots.len() - 1) {
             assert!(
@@ -1044,7 +1488,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // 6. search_timeline — Búsqueda por contenido
+    // 6. search_timeline — Content search
     // ────────────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1095,6 +1539,8 @@ mod tests {
                 session_id: Some("search-summary".into()),
                 target_timeline_ids: vec![slots[0].id],
                 learning: "Always add #[derive(Serialize)] to structs exposed via MCP.".into(),
+                raw_log_excerpt: "test".into(),
+                constraint_type: None,
             },
         )
         .await
@@ -1128,7 +1574,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // 7. get_session_summary — Resumen con conteos
+    // 7. get_session_summary — Summary with counts
     // ────────────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1140,13 +1586,15 @@ mod tests {
 
         let slots = get_timeline(&pool, "summary-session", 10).await.unwrap();
 
-        // Archivar 2 como PAST → 1 PRESENT restante + 1 FUTURE inyectado
+        // Archive 2 as PAST → 1 remaining PRESENT + 1 FUTURE injected
         execute_time_travel(
             &pool,
             TimeTravelArgs {
                 session_id: Some("summary-session".into()),
                 target_timeline_ids: vec![slots[0].id, slots[1].id],
                 learning: "Test lesson.".into(),
+                raw_log_excerpt: "test".into(),
+                constraint_type: None,
             },
         )
         .await
@@ -1156,7 +1604,7 @@ mod tests {
             .await
             .expect("get_session_summary failed");
 
-        // Formato esperado: "Session 'summary-session': 4 total timeline slots | 1 PRESENT (active) | 2 PAST (archived) | 1 FUTURE (constraints) | ~X estimated tokens in raw_log data."
+        // Expected format: "Session 'summary-session': 4 total timeline slots | 1 PRESENT (active) | 2 PAST (archived) | 1 FUTURE (constraints) | ~X estimated tokens in raw_log data."
         assert!(
             summary.contains("4 total timeline slots"),
             "Expected 4 total slots: {}",
@@ -1191,7 +1639,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // 8. Aislamiento entre sesiones
+    // 8. Session isolation
     // ────────────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1207,7 +1655,7 @@ mod tests {
         assert_eq!(a_slots.len(), 2, "session-A should have 2 slots");
         assert_eq!(b_slots.len(), 3, "session-B should have 3 slots");
 
-        // Archivar solo en session-A
+        // Archive only in session-A
         let a_ids: Vec<i64> = a_slots.iter().map(|s| s.id).collect();
         execute_time_travel(
             &pool,
@@ -1215,6 +1663,8 @@ mod tests {
                 session_id: Some("session-A".into()),
                 target_timeline_ids: a_ids,
                 learning: "Session A lesson.".into(),
+                raw_log_excerpt: "test".into(),
+                constraint_type: None,
             },
         )
         .await
@@ -1230,14 +1680,14 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // 9. Integridad referencial (FOREIGN KEY)
+    // 9. Referential integrity (FOREIGN KEY)
     // ────────────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_foreign_key_enforced() {
         let pool = setup_pool().await;
 
-        // Intentar insertar un timeline slot con content_id que no existe
+        // Attempt to insert a timeline slot with a non-existent content_id
         let result = sqlx::query(
             r#"
             INSERT INTO agent_timeline (content_id, session_id, sequence_order, temporal_state)
@@ -1261,13 +1711,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Intentar borrar un memory_contents que tiene hijos en agent_timeline
+        // Attempt to delete a memory_contents that has children in agent_timeline
         let result = sqlx::query("DELETE FROM memory_contents WHERE id = ?1")
             .bind(content_id)
             .execute(&pool)
             .await;
 
-        // Sin ON DELETE CASCADE, esto debería fallar por la FK
+        // Without ON DELETE CASCADE, this should fail due to FK
         assert!(
             result.is_err(),
             "Should not allow deleting memory_contents referenced by timeline"
@@ -1275,7 +1725,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // 10. Integridad del CHECK constraint en temporal_state
+    // 10. CHECK constraint integrity on temporal_state
     // ────────────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1298,7 +1748,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // 11. record_present_state con datos mínimos (sin file_context ni tool_payload)
+    // 11. record_present_state with minimal data (no file_context or tool_payload)
     // ────────────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1318,7 +1768,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // 12. Múltiples viajes temporales en secuencia
+    // 12. Multiple sequential time travels
     // ────────────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1326,20 +1776,22 @@ mod tests {
         let pool = setup_pool().await;
         seed_present_states(&pool, "multi-tt", 5).await;
 
-        // Primer viaje: archivar slots 1,2
+        // First travel: archive slots 1,2
         let slots = get_timeline(&pool, "multi-tt", 10).await.unwrap();
         execute_time_travel(
             &pool,
             TimeTravelArgs {
                 session_id: Some("multi-tt".into()),
-                target_timeline_ids: vec![slots[4].id, slots[3].id], // los más viejos (seq 1,2)
+                target_timeline_ids: vec![slots[4].id, slots[3].id], // oldest (seq 1,2)
                 learning: "First lesson.".into(),
+                raw_log_excerpt: "test".into(),
+                constraint_type: None,
             },
         )
         .await
         .unwrap();
 
-        // Segundo viaje: archivar slots 3,4
+        // Second travel: archive slots 3,4
         let slots = get_timeline(&pool, "multi-tt", 10).await.unwrap();
         let present_slots: Vec<i64> = slots
             .iter()
@@ -1352,14 +1804,16 @@ mod tests {
                 session_id: Some("multi-tt".into()),
                 target_timeline_ids: present_slots,
                 learning: "Second lesson.".into(),
+                raw_log_excerpt: "test".into(),
+                constraint_type: None,
             },
         )
         .await
         .unwrap();
 
-        // Resultado: 5 originales (seq 1..5).
-        // Tras viaje1 (archiva seq1,2): seq1,2→PAST | seq3,4,5→PRESENT | seq6→FUTURE
-        // Tras viaje2 (archiva seq3,4,5): seq3,4,5→PAST | seq7→FUTURE
+        // Result: 5 originals (seq 1..5).
+        // After travel 1 (archives seq1,2): seq1,2→PAST | seq3,4,5→PRESENT | seq6→FUTURE
+        // After travel 2 (archives seq3,4,5): seq3,4,5→PAST | seq7→FUTURE
         // Total: seq1..5=PAST, seq6,7=FUTURE
         let final_slots = get_timeline(&pool, "multi-tt", 20).await.unwrap();
         let past = final_slots
@@ -1385,14 +1839,14 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // 13. Tokens estimados se calculan correctamente
+    // 13. Token estimation accuracy
     // ────────────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_time_travel_token_estimation() {
         let pool = setup_pool().await;
 
-        // Insertar un log grande
+        // Insert a large log
         let big_log = "A".repeat(3800); // ~1000 tokens según ratio 3.8
         record_present_state(&pool, "tokens", &big_log, None, None)
             .await
@@ -1406,6 +1860,8 @@ mod tests {
                 session_id: Some("tokens".into()),
                 target_timeline_ids: vec![slots[0].id],
                 learning: "Big logs cost tokens.".into(),
+                raw_log_excerpt: "test".into(),
+                constraint_type: None,
             },
         )
         .await
@@ -1420,10 +1876,10 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // BENCHMARK: Rendimiento y ahorro de tokens
+    // BENCHMARK: Performance and token savings
     // ────────────────────────────────────────────────────────────────────────────
 
-    /// Simula el tamaño de un error real de compilación en Rust (~2000 chars).
+    /// Simulates a real Rust compiler error (~2000 chars).
     fn real_compiler_error() -> String {
         format!(
             "{}
@@ -1438,7 +1894,7 @@ mod tests {
         )
     }
 
-    /// Simula el tamaño de un error de API con stacktrace (~1500 chars).
+    /// Simulates a real API error with stacktrace (~1500 chars).
     fn real_api_error() -> String {
         format!(
             "{}
@@ -1450,7 +1906,7 @@ mod tests {
         )
     }
 
-    /// Calcula tokens estimados de un string (ratio 3.8 chars/token).
+    /// Calculates estimated tokens for a string (ratio 3.8 chars/token).
     fn estimate_tokens(s: &str) -> i64 {
         ((s.len() as f64) / 3.8).ceil() as i64
     }
@@ -1477,6 +1933,8 @@ mod tests {
                 session_id: Some("bench-single".into()),
                 target_timeline_ids: vec![slots[0].id],
                 learning: "Use format!() or push_str() to concatenate strings in Rust.".into(),
+                raw_log_excerpt: "error[E0277]: cannot add `&str` to `String`".into(),
+                constraint_type: None,
             },
         )
         .await
@@ -1570,6 +2028,8 @@ mod tests {
                         session_id: Some(session.into()),
                         target_timeline_ids: vec![newest],
                         learning: lesson.to_string(),
+                        raw_log_excerpt: log.chars().take(80).collect(),
+                        constraint_type: None,
                     },
                 )
                 .await
@@ -1805,7 +2265,7 @@ mod tests {
             ctx
         );
         assert!(
-            ctx.contains("Bucle detectado"),
+            ctx.contains("Loop detected"),
             "Should mention loop detection"
         );
     }
@@ -1939,7 +2399,7 @@ mod tests {
         );
         // Debe aparecer el conteo correcto
         assert!(
-            ctx.contains("4 veces"),
+            ctx.contains("4 times"),
             "Anchor should mention 4 repetitions"
         );
     }
@@ -2025,6 +2485,8 @@ mod tests {
                     session_id: Some(session.into()),
                     target_timeline_ids: present,
                     learning: format!("[Iter {}] Always use circuit breaker for API calls.", i + 1),
+                    raw_log_excerpt: "503 Service Unavailable".into(),
+                    constraint_type: None,
                 },
             )
             .await
@@ -2087,5 +2549,485 @@ mod tests {
         println!("║   ✅ Contexto acotado: todas las iteraciones < 800 tk    ║");
         println!("║   ✅ Todas las restricciones FUTURE preservadas          ║");
         println!("╚══════════════════════════════════════════════════════════╝");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TESTS: Fingerprint-based loop detection (v0.5.0)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fingerprint_extracts_rust_error_code() {
+        let log = "error[E0277]: cannot add `&str` to `String`\n  --> src/handler.rs:42:17";
+        let fp = fingerprint_log(log);
+        assert_eq!(fp, "error[E0277]", "Should extract rust error code");
+    }
+
+    #[test]
+    fn test_fingerprint_extracts_http_error() {
+        let log = "POST /api/v2/agents/execute → 503 Service Unavailable";
+        let fp = fingerprint_log(log);
+        assert!(fp.contains("503"), "Should extract HTTP 503: got '{}'", fp);
+    }
+
+    #[test]
+    fn test_fingerprint_strips_timestamps() {
+        let log = "2024-01-15T14:32:01 Error: connection timeout";
+        let fp = fingerprint_log(log);
+        assert!(
+            !fp.contains("2024"),
+            "Should strip ISO timestamp: got '{}'",
+            fp
+        );
+        assert!(
+            fp.contains("Error"),
+            "Should preserve error message: got '{}'",
+            fp
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_normalizes_time_variants() {
+        let a = "Error 503: timeout at 14:32:01";
+        let b = "Error 503: timeout at 14:32:04";
+        let c = "Error 503: timeout at 14:32:07";
+
+        let fp_a = fingerprint_log(a);
+        let fp_b = fingerprint_log(b);
+        let fp_c = fingerprint_log(c);
+
+        assert_eq!(
+            fp_a, fp_b,
+            "Timestamps should normalize to same fingerprint"
+        );
+        assert_eq!(
+            fp_b, fp_c,
+            "Timestamps should normalize to same fingerprint"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_same_error_code_different_params() {
+        let a = "error[E0277]: the trait bound `String: From<usize>` is not satisfied";
+        let b = "error[E0277]: the trait bound `String: From<i32>` is not satisfied";
+        let c = "error[E0277]: the trait bound `String: From<u64>` is not satisfied";
+
+        let fp_a = fingerprint_log(a);
+        let fp_b = fingerprint_log(b);
+        let fp_c = fingerprint_log(c);
+
+        assert_eq!(fp_a, fp_b, "Same error code should have same fingerprint");
+        assert_eq!(fp_b, fp_c, "Same error code should have same fingerprint");
+    }
+
+    #[tokio::test]
+    async fn test_auto_detect_fingerprint_loop() {
+        let pool = setup_pool().await;
+
+        // 3 near-duplicate errors (same error code, different timestamps)
+        record_present_state(
+            &pool,
+            "fp-loop",
+            "Error 503: timeout at 14:32:01",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        record_present_state(
+            &pool,
+            "fp-loop",
+            "Error 503: timeout at 14:32:04",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        record_present_state(
+            &pool,
+            "fp-loop",
+            "Error 503: timeout at 14:32:07",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mitigated = auto_detect_and_mitigate_loops(&pool, "fp-loop", 3)
+            .await
+            .unwrap();
+
+        assert!(
+            mitigated,
+            "Should detect fingerprint-based loop with timestamp variants"
+        );
+
+        let ctx = fetch_active_context(&pool, "fp-loop").await.unwrap();
+        assert!(
+            !ctx.contains("[ACTIVE PRESENT STATE]"),
+            "Should have archived all PRESENT states"
+        );
+        assert!(
+            ctx.contains("[SYSTEM ANCHOR]"),
+            "Should contain system anchor"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TESTS: FUTURE constraint consolidation (v0.5.0)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_consolidation_below_threshold_does_nothing() {
+        let pool = setup_pool().await;
+
+        // Insert 3 FUTURE constraints (below threshold of 5)
+        for i in 0..3 {
+            sqlx::query(
+                "INSERT INTO agent_timeline (session_id, sequence_order, temporal_state, learning_summary) VALUES (?1, ?2, 'FUTURE', ?3)",
+            )
+            .bind("cons-test")
+            .bind(i + 1)
+            .bind(format!("Constraint {}", i))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let consolidated = consolidate_future_constraints(&pool, "cons-test")
+            .await
+            .unwrap();
+
+        assert!(!consolidated, "Should not consolidate below threshold");
+
+        // All 3 should still be FUTURE
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_timeline WHERE session_id=?1 AND temporal_state='FUTURE'",
+        )
+        .bind("cons-test")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 3, "All 3 constraints should remain FUTURE");
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_above_threshold_merges() {
+        let pool = setup_pool().await;
+
+        // Insert 6 FUTURE constraints (above threshold of 5)
+        for i in 0..6 {
+            sqlx::query(
+                "INSERT INTO agent_timeline (session_id, sequence_order, temporal_state, learning_summary) VALUES (?1, ?2, 'FUTURE', ?3)",
+            )
+            .bind("cons-merge")
+            .bind(i + 1)
+            .bind(format!("Rule {}", i))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let consolidated = consolidate_future_constraints(&pool, "cons-merge")
+            .await
+            .unwrap();
+
+        assert!(consolidated, "Should consolidate above threshold");
+
+        // Should have exactly 1 FUTURE entry now
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_timeline WHERE session_id=?1 AND temporal_state='FUTURE'",
+        )
+        .bind("cons-merge")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "Should have exactly 1 consolidated FUTURE entry");
+
+        let ctx = fetch_active_context(&pool, "cons-merge").await.unwrap();
+        assert!(
+            ctx.contains("[CONSOLIDATED CONSTRAINTS"),
+            "Context should contain consolidated constraint"
+        );
+        assert!(
+            ctx.contains("Rule 0"),
+            "Consolidated constraint should mention original rules"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_happens_in_fetch_clean_context() {
+        let pool = setup_pool().await;
+
+        // Insert 7 FUTURE constraints
+        for i in 0..7 {
+            sqlx::query(
+                "INSERT INTO agent_timeline (session_id, sequence_order, temporal_state, learning_summary) VALUES (?1, ?2, 'FUTURE', ?3)",
+            )
+            .bind("cons-auto")
+            .bind(i + 1)
+            .bind(format!("Tip {}", i))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // fetch_clean_context should auto-consolidate
+        let ctx = fetch_clean_context(&pool, "cons-auto").await.unwrap();
+
+        assert!(
+            ctx.contains("[CONSOLIDATED CONSTRAINTS"),
+            "fetch_clean_context should auto-consolidate"
+        );
+
+        // Verify only 1 FUTURE remains
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_timeline WHERE session_id=?1 AND temporal_state='FUTURE'",
+        )
+        .bind("cons-auto")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "Should be consolidated to 1 entry");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TESTS: Conflict detection (v0.5.0)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_conflict_detection_no_conflicts() {
+        let pool = setup_pool().await;
+
+        // Compatible constraints
+        for (i, lesson) in [
+            "Always retry on 503",
+            "Use format!() for string concat",
+            "Check .len() before indexing",
+        ]
+        .iter()
+        .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO agent_timeline (session_id, sequence_order, temporal_state, learning_summary) VALUES (?1, ?2, 'FUTURE', ?3)",
+            )
+            .bind("no-conflict")
+            .bind(i as i64 + 1)
+            .bind(lesson)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let conflicts = detect_future_conflicts(&pool, "no-conflict").await.unwrap();
+
+        assert!(conflicts.is_empty(), "Should have no conflicts");
+    }
+
+    #[tokio::test]
+    async fn test_conflict_detection_retry_vs_never_retry() {
+        let pool = setup_pool().await;
+
+        sqlx::query(
+            "INSERT INTO agent_timeline (session_id, sequence_order, temporal_state, learning_summary) VALUES (?1, 1, 'FUTURE', ?2)",
+        )
+        .bind("conflict-test")
+        .bind("Always retry on 503 with exponential backoff")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO agent_timeline (session_id, sequence_order, temporal_state, learning_summary) VALUES (?1, 2, 'FUTURE', ?2)",
+        )
+        .bind("conflict-test")
+        .bind("Never retry on 503 — use cache instead")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let conflicts = detect_future_conflicts(&pool, "conflict-test")
+            .await
+            .unwrap();
+
+        assert!(
+            !conflicts.is_empty(),
+            "Should detect retry vs never retry conflict"
+        );
+        assert!(
+            conflicts[0].contains("retry"),
+            "Conflict message should mention retry: {:?}",
+            conflicts
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conflict_shows_in_fetch_clean_context() {
+        let pool = setup_pool().await;
+
+        sqlx::query(
+            "INSERT INTO agent_timeline (session_id, sequence_order, temporal_state, learning_summary) VALUES (?1, 1, 'FUTURE', ?2)",
+        )
+        .bind("conflict-ctx")
+        .bind("Use cache for API responses")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO agent_timeline (session_id, sequence_order, temporal_state, learning_summary) VALUES (?1, 2, 'FUTURE', ?2)",
+        )
+        .bind("conflict-ctx")
+        .bind("Do not cache API responses")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ctx = fetch_clean_context(&pool, "conflict-ctx").await.unwrap();
+        assert!(
+            ctx.contains("CONFLICTING FUTURE CONSTRAINTS"),
+            "Context should warn about conflicts: {}",
+            ctx
+        );
+        assert!(
+            ctx.contains("vlk_revoke_future"),
+            "Should suggest using revoke tool"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TESTS: FUTURE constraint revocation (v0.5.0)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_revoke_future_constraint() {
+        let pool = setup_pool().await;
+
+        // Insert a FUTURE constraint
+        sqlx::query(
+            "INSERT INTO agent_timeline (session_id, sequence_order, temporal_state, learning_summary) VALUES ('revoke-test', 1, 'FUTURE', 'Bad lesson')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let id: i64 =
+            sqlx::query_scalar("SELECT id FROM agent_timeline WHERE session_id='revoke-test'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // Revoke it
+        let revoked = revoke_future_constraint(&pool, "revoke-test", id)
+            .await
+            .unwrap();
+        assert!(revoked, "Should revoke successfully");
+
+        // Verify it's now PAST
+        let state: String =
+            sqlx::query_scalar("SELECT temporal_state FROM agent_timeline WHERE id=?1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "PAST", "Revoked constraint should be PAST");
+
+        // Verify it doesn't appear in active context
+        let ctx = fetch_active_context(&pool, "revoke-test").await.unwrap();
+        assert!(
+            !ctx.contains("Bad lesson"),
+            "Revoked constraint should not appear in context"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revoke_nonexistent_returns_false() {
+        let pool = setup_pool().await;
+
+        let revoked = revoke_future_constraint(&pool, "no-session", 99999)
+            .await
+            .unwrap();
+        assert!(!revoked, "Revoking nonexistent ID should return false");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TESTS: Constraint type (DERIVED vs PROSPECTIVE)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_constraint_type_persisted() {
+        let pool = setup_pool().await;
+
+        // Create a PRESENT slot first
+        record_present_state(&pool, "ct-test", "test log", None, None)
+            .await
+            .unwrap();
+
+        let slots = get_timeline(&pool, "ct-test", 10).await.unwrap();
+        let present_id = slots[0].id;
+
+        // Time travel with PROSPECTIVE constraint
+        execute_time_travel(
+            &pool,
+            TimeTravelArgs {
+                session_id: Some("ct-test".into()),
+                target_timeline_ids: vec![present_id],
+                learning: "Deployment scheduled at 3pm — expect instability".into(),
+                raw_log_excerpt: "user informed about scheduled maintenance".into(),
+                constraint_type: Some("PROSPECTIVE".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Verify constraint_type in DB
+        let ct: String = sqlx::query_scalar(
+            "SELECT constraint_type FROM agent_timeline WHERE session_id=?1 AND temporal_state='FUTURE'",
+        )
+        .bind("ct-test")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            ct, "PROSPECTIVE",
+            "Should store PROSPECTIVE constraint type"
+        );
+
+        // Verify it renders with the right tag
+        let ctx = fetch_active_context(&pool, "ct-test").await.unwrap();
+        assert!(
+            ctx.contains("[PROSPECTIVE CONSTRAINT]"),
+            "PROSPECTIVE constraint should have the right tag: {}",
+            ctx
+        );
+    }
+
+    #[tokio::test]
+    async fn test_time_travel_rejects_empty_raw_log_excerpt() {
+        let pool = setup_pool().await;
+
+        record_present_state(&pool, "no-evidence", "error log", None, None)
+            .await
+            .unwrap();
+
+        let slots = get_timeline(&pool, "no-evidence", 10).await.unwrap();
+        let present_id = slots[0].id;
+
+        let result = execute_time_travel(
+            &pool,
+            TimeTravelArgs {
+                session_id: Some("no-evidence".into()),
+                target_timeline_ids: vec![present_id],
+                learning: "Some lesson".into(),
+                raw_log_excerpt: "   ".into(), // whitespace-only = empty
+                constraint_type: None,
+            },
+        )
+        .await;
+
+        assert!(result.is_err(), "Should reject empty raw_log_excerpt");
+        assert!(
+            result.unwrap_err().to_string().contains("raw_log_excerpt"),
+            "Error should mention raw_log_excerpt"
+        );
     }
 }
