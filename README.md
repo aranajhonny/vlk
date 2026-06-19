@@ -1,70 +1,76 @@
-# 🧠 Agora — Vlk MemAct
+# Agora — Vlk MemAct
 
-> *"If an AI cannot remember its own mistakes, it is not intelligent — it is amnesic. Chronesthesia is the substrate of learning."*
+> *"If an AI cannot remember its own mistakes, it is not intelligent — it is amnesic."*
 
-**Vlk MemAct** is a neuro-inspired memory layer for AI agents that implements **chronesthesia** — the brain's ability to mentally travel through subjective time. It separates *what happened* (content) from *when it matters* (temporal state), allowing agents to learn from failure, project preventive constraints forward, and stop repeating the same mistakes.
+**Vlk MemAct** is a stateful memory layer for AI agents. It separates *what happened* (content) from *when it matters* (temporal state), so agents can learn from failure, project preventive rules forward, and stop repeating mistakes.
 
 ---
 
-## ⚡ The Problem
+## The Problem
 
 Current AI agents suffer from **context amnesia**:
 
 | Symptom | Root Cause |
 |---------|------------|
 | Repeating the same error 5+ times | No failure memory |
-| Context window bloat from stale logs | No PAST archiving |
+| Context window bloat from stale logs | No archiving |
 | Contradictory directives accumulate | No conflict detection |
-| "Learned lessons" evaporate between sessions | No FUTURE projection |
+| "Learned lessons" evaporate between sessions | No persistent projections |
 
-The result: wasted tokens, frustrated users, and agents that look intelligent but behave like they have anterograde amnesia.
+The result: wasted tokens, frustrated users, and agents that cannot improve.
 
 ---
 
-## 🧬 First Principles
+## Architecture
 
-The architecture is based on **Nyberg & Tulving (2010)** — *"Consciousness of subjective time in the brain"* (PNAS). Their key finding: the brain does **not** use the hippocampus (content memory) for mental time travel. It uses a **separate network in the left lateral parietal cortex**.
-
-We emulate this separation:
+Two tables, three states.
 
 ```
 ┌─────────────────────────────────────────────────┐
-│           HIPPOCAMPAL LAYER                      │
-│           (memory_contents)                      │
-│  Immutable. Pure content. No time awareness.     │
+│             memory_contents                      │
+│  Immutable. Pure content. No temporal logic.     │
 │  • raw_log        — the error / stacktrace       │
 │  • file_context   — source file location         │
 │  • tool_payload   — serialized tool call         │
 └──────────────┬──────────────────────────────────┘
                │ content_id (FK)
 ┌──────────────▼──────────────────────────────────┐
-│           PARIETAL LAYER                        │
-│           (agent_timeline)                      │
-│  Temporal awareness. Subjective chronology.     │
-│                                                 │
+│             agent_timeline                       │
+│  Each slot = content + temporal state + position │
+│                                                  │
 │  ┌──────────┐   ┌──────┐   ┌──────────┐         │
 │  │ PRESENT  │ → │ PAST │   │  FUTURE  │         │
 │  │ active   │   │archvd│   │preventive│         │
 │  │ context  │   │hidden│   │constraint│         │
 │  └──────────┘   └──────┘   └──────────┘         │
 │     injected      hidden      injected           │
-│     to LLM        from LLM    as [CONSTRAINT]   │
+│     to LLM        from LLM    as [CONSTRAINT]    │
 └─────────────────────────────────────────────────┘
 ```
 
-**Three temporal states.** No more, no less:
+**Three temporal states:**
 
 - **PRESENT** — What the agent processes *now*. Full content injected into the LLM.
 - **PAST** — Dead ends. Already learned from. Hidden from context to save tokens.
-- **FUTURE** — Preventive constraints extrapolated from experience. Injected as `[PREVENTIVE FUTURE CONSTRAINT]` or `[PROSPECTIVE CONSTRAINT]` headers.
+- **FUTURE** — Preventive constraints extrapolated from experience, injected as `[PREVENTIVE FUTURE CONSTRAINT]` or `[PROSPECTIVE CONSTRAINT]` headers.
 
 ---
 
-## 🔧 Capabilities
+## Capabilities
 
-### 1. Mental Time Travel (`vlk_time_travel`)
+### 1. State Recording (`vlk_record_state`)
 
-The computational equivalent of closing a stuck present and projecting forward:
+Push errors, logs, or observations into the system as PRESENT timeline slots:
+
+```
+📝 [VLK RECORD] PRESENT state recorded as content_id=42 in session 'default'
+```
+
+Once recorded, the loop detector and time travel can operate on this data. Without this, the memory tables stay empty.
+
+### 2. Time Travel (`vlk_time_travel`)
+
+Archive PRESENT slots to PAST and inject a FUTURE constraint:
 
 ```
 PRESENT slots (error loop)  ──►  PAST (archived, ~N tokens saved)
@@ -75,15 +81,19 @@ PRESENT slots (error loop)  ──►  PAST (archived, ~N tokens saved)
 
 **Requires evidence.** Every constraint must be grounded in a `raw_log_excerpt` — the original error that justifies the lesson. No unverified constraints.
 
-### 2. Automatic Loop Interception
+### 3. Automatic Loop Interception
 
-The system **detects and mitigates error loops without human intervention**:
+Scans PRESENT slots for repeated errors and **auto-mitigates without human intervention**:
 
-- Scans PRESENT slots for repeated errors
-- **Fingerprint-based grouping** catches near-duplicates (same error code, different timestamps)
-- Rust error code extraction: `error[E0277]` → `error[E0597]`
-- HTTP status extraction: `503 Service Unavailable` → `429 Too Many Requests`
-- Timestamp normalization for generic logs
+- Fingerprint-based grouping catches near-duplicates (same error code, different timestamps/parameters)
+- Recognizes errors from multiple languages and runtimes:
+  - **Rust** — `error[E0277]`, `error[E0597]`
+  - **TypeScript/JS** — `TS2345`, `TypeError`, `SyntaxError`, `ReferenceError`
+  - **Python** — `ValueError`, `KeyError`, `ImportError`, `AttributeError`, etc.
+  - **Go** — `panic: nil pointer dereference`, `fatal error: concurrent map writes`
+  - **HTTP** — `503 Service Unavailable`, `429 Too Many Requests`, `Error 500`
+  - **Test failures** — `expected: X, got: Y`, `AssertionError`, `assert_eq!`, `expect().toBe()`
+  - **Fallback** — first 80 chars with timestamps stripped
 - At ≥3 repetitions → auto-archives to PAST + injects `[SYSTEM ANCHOR]` constraint
 
 ```
@@ -91,27 +101,25 @@ The system **detects and mitigates error loops without human intervention**:
 detection=fingerprint, ~1,200 tokens saved.
 ```
 
-### 3. FUTURE Constraint Consolidation
+### 4. FUTURE Constraint Consolidation
 
-Constraints are learning — but too many become noise. When FUTURE entries exceed **5**, they auto-merge into a single consolidated constraint:
+When FUTURE entries exceed **5**, they auto-merge into a single consolidated constraint. To prevent unbounded growth, duplicates are removed and the string is capped at 2000 characters (~500 tokens), keeping the newest lessons.
 
 ```
 [CONSOLIDATED CONSTRAINTS from 7 prior lessons]:
   Use cache | Never retry HTTP 429 | Avoid format! in hot path | ...
 ```
 
-### 4. Conflict Detection
+### 5. Conflict Detection
 
-Lightweight, rule-based detection of contradictory directives. No ML required — just targeted heuristics:
+Lightweight, rule-based detection of contradictory directives. No ML required:
 
 ```
 ⚠ Constraint #12 vs #17: retry vs. never retry
 ⚠ Constraint #8 vs #23: exponential vs. linear backoff
 ```
 
-Detected pairs are surfaced so the agent (or user) can revoke the wrong one with `vlk_revoke_future`.
-
-### 5. Clean Context Fetching
+### 6. Clean Context Fetching
 
 `vlk_fetch_context` runs the full pipeline before returning context to the LLM:
 
@@ -119,11 +127,11 @@ Detected pairs are surfaced so the agent (or user) can revoke the wrong one with
 Loop Interception → Consolidation → Conflict Detection → Clean Context
 ```
 
-The LLM never sees repeated errors. It only sees PRESENT + sanitized FUTURE constraints.
+The LLM never sees repeated errors. Only PRESENT + sanitized FUTURE constraints.
 
 ---
 
-## 📡 Protocol
+## Protocol
 
 Vlk MemAct is an **MCP (Model Context Protocol) server** operating over **JSON-RPC 2.0 via stdio**.
 
@@ -132,20 +140,21 @@ IDE / Agent Host  ──stdin──►  Vlk MCP Server  ──►  SQLite (WAL)
                   ◄─stdout──                    ◄──
 ```
 
-**6 exposed tools:**
+**7 exposed tools:**
 
 | Tool | Purpose |
 |------|---------|
+| `vlk_record_state` | Push a log/error as a PRESENT timeline slot |
 | `vlk_time_travel` | PRESENT → PAST + FUTURE injection |
 | `vlk_get_history` | Full timeline audit |
 | `vlk_search_memory` | Keyword search across logs + constraints |
 | `vlk_summarize_session` | State counts + token estimates |
-| `vlk_fetch_context` | Clean active context (interceptor pipeline) |
+| `vlk_fetch_context` | Clean active context (interceptor + consolidation pipeline) |
 | `vlk_revoke_future` | Remove incorrectly learned constraints |
 
 ---
 
-## 🏗️ Architecture
+## Project Structure
 
 ```
 vlk-core/
@@ -153,13 +162,13 @@ vlk-core/
 │   ├── main.rs                    # JSON-RPC stdio loop, MCP tool definitions
 │   └── memory/
 │       ├── mod.rs                 # Module root
-│       └── chronesthesia.rs       # Core temporal engine (1,025 lines)
+│       └── chronesthesia.rs       # Core temporal engine (~1,025 lines)
 ├── Cargo.toml                     # Rust 2021, tokio, sqlx, serde
 ├── benches/                       # Benchmarks (TODO)
 └── tests/                         # Integration tests (TODO)
 ```
 
-### Dependencies (zero bloat)
+### Dependencies
 
 | Crate | Why |
 |-------|-----|
@@ -176,10 +185,10 @@ vlk-core/
 SQLite with WAL journal mode. Two tables:
 
 ```sql
-memory_contents (hippocampal)
+memory_contents
   id, raw_log, file_context, tool_payload
 
-agent_timeline (parietal)
+agent_timeline
   id, content_id(FK), session_id, sequence_order,
   temporal_state CHECK('PRESENT','PAST','FUTURE'),
   learning_summary, constraint_type CHECK('DERIVED','PROSPECTIVE'),
@@ -190,7 +199,7 @@ Indexed on `(session_id, temporal_state, sequence_order)` for zero-overhead acti
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
 # Build
@@ -208,18 +217,17 @@ The server connects via stdio — your IDE or agent host sends JSON-RPC lines on
 
 ---
 
-## 📊 Current Status
+## Current Status
 
 | Area | Status |
 |------|--------|
-| Core chronesthesia engine | ✅ Complete (v0.4.0-chronesthesia) |
+| Core temporal engine | ✅ Complete |
 | MCP protocol | ✅ JSON-RPC 2.0, protocol 2024-11-05 |
-| 6 MCP tools | ✅ All implemented |
-| Loop detection (fingerprint-based) | ✅ 3 detection strategies |
-| FUTURE consolidation | ✅ Auto-merges at 5+ constraints |
+| 7 MCP tools | ✅ All implemented |
+| Loop detection (fingerprint-based) | ✅ 11+ error patterns across Rust, TS/JS, Python, Go, HTTP, test frameworks |
+| FUTURE consolidation | ✅ Auto-merges at 5+ constraints, bounded at 2000 chars |
 | Conflict detection | ✅ 10 keyword-pair heuristics |
 | Constraint revocation | ✅ `vlk_revoke_future` |
-| Legacy `agent_history` table | ⚠️ Deprecated, kept for compatibility |
 | Automated tests | ❌ TODO — `tests/` directory exists, empty |
 | Benchmarks | ❌ TODO — `benches/` directory exists, empty |
 | UUID-based session identity | ⚠️ `uuid` crate imported, not yet integrated |
@@ -227,33 +235,12 @@ The server connects via stdio — your IDE or agent host sends JSON-RPC lines on
 
 ---
 
-## 🔮 Roadmap
+## Design Philosophy
 
-1. **Test suite** — Unit tests for fingerprint extraction, conflict detection, consolidation logic
-2. **Benchmarks** — Measure context fetch latency, loop detection throughput
-3. **Persistent session identity** — Integrate `uuid` for cross-restart session continuity
-4. **Semantic conflict detection** — Replace keyword heuristics with embedding-based similarity for contradiction detection
-5. **Multi-agent support** — Shared FUTURE constraints across agent sessions
-6. **Constraint decay** — FUTURE constraints that expire after N successful iterations without re-triggering
-
----
-
-## 🧪 Scientific Foundation
-
-> Nyberg, L., & Tulving, E. (2010). *Consciousness of subjective time in the brain.*  
-> Proceedings of the National Academy of Sciences, 107(51), 21773–21774.  
-> https://doi.org/10.1073/pnas.1016823108
-
-The key insight applied here: **consciousness of time is not a byproduct of memory — it is a separate cognitive function**. An agent that stores everything in one undifferentiated log is like a brain with no parietal cortex. It has content but no temporal awareness. Vlk gives agents that awareness.
-
----
-
-## ⚙️ Design Philosophy
-
-- **First principles over pattern matching.** The brain's separation of content and time is the architecture. Not "best practices."
+- **Separation of content and state.** Logs live in one table, temporal metadata in another. Decoupled by foreign key.
 - **Evidence over speculation.** Every FUTURE constraint requires a `raw_log_excerpt`. No ungrounded lessons.
 - **Automatic over manual.** Loop detection, consolidation, conflict detection — the system cleans itself.
-- **Minimal over maximal.** 6 tools, 2 tables, 0 external services. Does one thing: temporal awareness.
+- **Minimal over maximal.** 7 tools, 2 tables, 0 external services. Does one thing: temporal awareness.
 - **Tokens are the unit of cost.** Every decision optimizes for token efficiency in the LLM context window.
 
 ---

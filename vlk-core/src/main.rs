@@ -8,7 +8,7 @@ mod memory;
 
 use memory::chronesthesia::{
     self, execute_time_travel, fetch_clean_context, get_session_summary, get_timeline,
-    revoke_future_constraint, search_timeline, TimeTravelArgs,
+    record_present_state, revoke_future_constraint, search_timeline, TimeTravelArgs,
 };
 
 // ── JSON-RPC Types ───────────────────────────────────────────────────────────
@@ -49,34 +49,9 @@ fn get_session_id(args: &serde_json::Value) -> String {
 
 // ── Database Setup ───────────────────────────────────────────────────────────
 async fn init_db(pool: &SqlitePool) -> Result<()> {
-    // Legacy table — kept for backward compatibility, no longer used by tools
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS agent_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            mem_id INTEGER NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            tokens_estimated INTEGER NOT NULL,
-            tool_call_id TEXT,
-            tool_calls TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            parent_mem_id INTEGER,
-            importance REAL DEFAULT 1.0
-        );
-
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_session_mem
-            ON agent_history(session_id, mem_id);
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    // New neuro-inspired tables
     chronesthesia::init_chronesthesia_tables(pool).await?;
 
-    info!("Database initialized: agent_history (legacy) + memory_contents + agent_timeline");
+    info!("Database initialized: memory_contents + agent_timeline");
     Ok(())
 }
 
@@ -86,7 +61,7 @@ fn tool_definitions() -> serde_json::Value {
         "tools": [
             {
                 "name": "vlk_time_travel",
-                "description": "Chronesthetic memory management. Transitions PRESENT timeline slots to PAST and injects a FUTURE constraint. Use when stuck in a failure loop or context is cluttered. Check vlk_get_history for [timeline:N] IDs. Requires raw_log_excerpt as evidence — the original error/log that grounds this lesson.",
+                "description": "Archive PRESENT timeline slots to PAST and inject a FUTURE constraint. Use when stuck in a failure loop or context is cluttered. Check vlk_get_history for timeline IDs. Requires raw_log_excerpt as evidence — the original error/log that grounds the lesson.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -167,6 +142,20 @@ fn tool_definitions() -> serde_json::Value {
                         "timeline_id": { "type": "integer", "description": "The timeline slot ID (FUTURE state) to revoke." }
                     },
                     "required": ["timeline_id"]
+                }
+            },
+            {
+                "name": "vlk_record_state",
+                "description": "Record a log/error as a PRESENT timeline slot. Use this to feed real-time errors, logs, or observations into the chronesthesia system so vlk_time_travel and loop detection have data to operate on. Call this before vlk_fetch_context when the agent encounters relevant state.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string", "description": "Optional. Defaults to 'default'." },
+                        "raw_log": { "type": "string", "description": "REQUIRED. The error message, log line, or observation to record." },
+                        "file_context": { "type": "string", "description": "Optional. File path or module name where the log originated." },
+                        "tool_payload": { "type": "string", "description": "Optional. JSON payload of the tool call that produced this state." }
+                    },
+                    "required": ["raw_log"]
                 }
             }
         ]
@@ -319,6 +308,37 @@ impl AppState {
                             })),
                             Ok(false) => err(format!("No FUTURE constraint found with id #{timeline_id} in session '{session_id}'.")),
                             Err(e) => err(format!("Revoke failed: {e}")),
+                        }
+                    }
+
+                    // ── vlk_record_state: log an error/observation as a PRESENT timeline slot ──
+                    "vlk_record_state" => {
+                        let session_id = get_session_id(args);
+                        let raw_log = args["raw_log"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                        let file_context = args["file_context"].as_str().map(|s| s.to_string());
+                        let tool_payload = args["tool_payload"].as_str().map(|s| s.to_string());
+
+                        if raw_log.is_empty() {
+                            return err("Field 'raw_log' is required.".into());
+                        }
+
+                        match record_present_state(
+                            &self.db,
+                            &session_id,
+                            &raw_log,
+                            file_context.as_deref(),
+                            tool_payload.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(content_id) => ok(serde_json::json!({
+                                "content": [{ "type": "text", "text": format!("📝 [VLK RECORD] PRESENT state recorded as content_id={content_id} in session '{session_id}'. It will appear in subsequent vlk_fetch_context calls until archived via vlk_time_travel.") }]
+                            })),
+                            Err(e) => err(format!("Record failed: {e}")),
                         }
                     }
 

@@ -1,20 +1,18 @@
-// ── Chronesthetic Layer (Left Parietal Cortex) ───────────────────────────────
-// Based on Nyberg & Tulving (2010): "Consciousness of subjective time in the brain"
+// ── Temporal State Engine ────────────────────────────────────────────────────
 //
-// The brain does not use the hippocampus (content) for mental time travel, but a
-// differentiated network in the left lateral parietal cortex. This implementation
-// emulates that specialization: we separate content (hippocampus) from temporal
-// awareness (parietal) so the agent can position itself relative to its own history.
+// The agent's memory has two concerns: content (what happened) and temporal
+// state (when it matters). Content is stored immutably in memory_contents;
+// temporal state is tracked in agent_timeline. Each timeline slot carries
+// one of three states:
 //
-// TemporalState represents the three modes of subjective time awareness:
 //   PRESENT → what the agent is processing right now (active context)
 //   PAST    → dead ends, already learned from (hidden from context)
 //   FUTURE  → preventive constraints extrapolated from experience
 //
-// Reference:
-//   Nyberg, L., & Tulving, E. (2010). Consciousness of subjective time in the brain.
-//   Proceedings of the National Academy of Sciences, 107(51), 21773–21774.
-//   https://doi.org/10.1073/pnas.1016823108
+// The core operations are:
+// - record_present_state : push new content + PRESENT slot
+// - execute_time_travel  : PRESENT → PAST, inject FUTURE constraint
+// - fetch_clean_context  : loop detection + consolidation + active context
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -24,49 +22,8 @@ use tracing::info;
 
 // ── Tipos de Estado Temporal ────────────────────────────────────────────────
 
-/// The three modes of the agent's subjective time awareness.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-#[allow(dead_code)]
-pub enum TemporalState {
-    /// Active context: what the agent is currently processing.
-    /// Injected into the LLM prompt with full content.
-    PRESENT,
-    /// Dead end: the agent has already learned from this experience.
-    /// Hidden from active context to save tokens.
-    PAST,
-    /// Preventive constraint: an extrapolated lesson that modulates the agent's
-    /// future behavior. Always injected as [PREVENTIVE FUTURE CONSTRAINT].
-    FUTURE,
-}
-
-impl TemporalState {
-    #[allow(dead_code)]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TemporalState::PRESENT => "PRESENT",
-            TemporalState::PAST => "PAST",
-            TemporalState::FUTURE => "FUTURE",
-        }
-    }
-}
-
-// ── Estructuras de Datos ────────────────────────────────────────────────────
-
-/// HIPPOCAMPAL LAYER: Pure, immutable content.
-/// Stores logs, stacktraces, tool payloads. Does not change.
-/// It is the "what happened" stripped of all temporal interpretation.
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
-#[allow(dead_code)]
-pub struct MemoryContent {
-    pub id: i64,
-    pub raw_log: String,
-    pub file_context: Option<String>,
-    pub tool_payload: Option<String>,
-}
-
-/// PARIETAL LAYER: The agent's subjective timeline.
-/// Each slot associates content (optional) with a temporal state and a position
-/// in the agent's subjective chronology.
+/// A slot in the agent's timeline. Each slot joins content (from memory_contents)
+/// with a temporal state and a position in the session chronology.
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct TimelineSlot {
     pub id: i64,
@@ -81,26 +38,6 @@ pub struct TimelineSlot {
     // Enriched fields via JOIN with memory_contents
     pub raw_log: Option<String>,
     pub file_context: Option<String>,
-}
-
-/// Constraint origin — distinguishes scar tissue (derived from failure) from
-/// genuine foresight (user-provided deadlines, maintenance windows, etc.).
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-#[allow(dead_code)]
-pub enum ConstraintType {
-    /// Retrospective: learned from past failure, projected forward.
-    DERIVED,
-    /// Prospective: genuine foresight (deadlines, planned maintenance, etc.).
-    PROSPECTIVE,
-}
-
-impl ConstraintType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ConstraintType::DERIVED => "DERIVED",
-            ConstraintType::PROSPECTIVE => "PROSPECTIVE",
-        }
-    }
 }
 
 /// Argumentos de entrada para el comando `vlk_time_travel`.
@@ -122,7 +59,7 @@ pub struct TimeTravelArgs {
 
 // ── Database Initialization ───────────────────────────────────────────────────
 
-/// Creates the `memory_contents` (hippocampal) and `agent_timeline` (parietal) tables.
+/// Creates the `memory_contents` and `agent_timeline` tables.
 pub async fn init_chronesthesia_tables(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         r#"
@@ -172,8 +109,7 @@ pub async fn init_chronesthesia_tables(pool: &SqlitePool) -> Result<()> {
 // ── Core Operation: vlk_time_travel ────────────────────────────────────────────
 
 /// Transitions timeline slots from PRESENT → PAST and injects a FUTURE constraint.
-/// This is the computational equivalent of mental time travel:
-/// the agent "closes" a stuck present and projects a rule forward.
+/// Transitions timeline slots from PRESENT → PAST and injects a FUTURE constraint.
 pub async fn execute_time_travel(pool: &SqlitePool, args: TimeTravelArgs) -> Result<(i64, String)> {
     let session_id = args.session_id.unwrap_or_else(|| "default".to_string());
     let learning = args.learning.trim().to_string();
@@ -363,9 +299,13 @@ const FUTURE_CONSOLIDATION_THRESHOLD: usize = 5;
 /// compiler error with different line numbers, etc.
 ///
 /// Strategy (ranked by specificity):
-/// 1. Extract Rust error codes: `error[E0277]`
-/// 2. Extract HTTP status + message prefix: `503 Service Unavailable`
-/// 3. Fall back to first 80 chars with timestamps stripped
+/// 1. Rust error codes: `error[E0277]`
+/// 2. TypeScript/JS errors: `TS2345`, `TypeError`, `SyntaxError`
+/// 3. Python tracebacks: last line exception type + message
+/// 4. Go/Rust panics: `panic:`, `fatal error:`
+/// 5. Test assertion failures: `expected: ... got:`, `AssertionError`
+/// 6. HTTP status + message prefix: `503 Service Unavailable`
+/// 7. Fall back to first 80 chars with timestamps stripped
 fn fingerprint_log(raw_log: &str) -> String {
     let trimmed = raw_log.trim();
 
@@ -374,12 +314,32 @@ fn fingerprint_log(raw_log: &str) -> String {
         return cap;
     }
 
-    // 2. HTTP status code pattern: "NNN StatusText" or "Error NNN"
+    // 2. TypeScript / JavaScript compiler & runtime errors
+    if let Some(cap) = extract_ts_error(trimmed) {
+        return cap;
+    }
+
+    // 3. Python traceback — last line exception
+    if let Some(cap) = extract_python_error(trimmed) {
+        return cap;
+    }
+
+    // 4. Go / Rust panics
+    if let Some(cap) = extract_panic(trimmed) {
+        return cap;
+    }
+
+    // 5. Test assertion failures
+    if let Some(cap) = extract_test_failure(trimmed) {
+        return cap;
+    }
+
+    // 6. HTTP status code pattern: "NNN StatusText" or "Error NNN"
     if let Some(cap) = extract_http_error(trimmed) {
         return cap;
     }
 
-    // 3. Fallback: first 80 chars with timestamp/datetime noise stripped
+    // 7. Fallback: first 80 chars with timestamp/datetime noise stripped
     strip_timestamps(&trimmed.chars().take(80).collect::<String>())
         .trim()
         .to_string()
@@ -432,6 +392,219 @@ fn extract_http_error(log: &str) -> Option<String> {
             }
         }
     }
+    None
+}
+
+/// Extracts TypeScript compiler errors (TSdddd) or JS runtime error names.
+fn extract_ts_error(log: &str) -> Option<String> {
+    // TypeScript compiler errors: TS2345: ... or error TS2345: ...
+    if let Some(start) = log.find("TS") {
+        let code_start = start + 2;
+        let rest = &log[code_start..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if end >= 4 {
+            let code = &rest[..end];
+            return Some(format!("TS{}", code));
+        }
+    }
+
+    // JS runtime errors: TypeError: ..., SyntaxError: ..., ReferenceError: ..., RangeError: ...
+    for kind in &[
+        "TypeError",
+        "SyntaxError",
+        "ReferenceError",
+        "RangeError",
+        "URIError",
+        "EvalError",
+    ] {
+        if let Some(pos) = log.find(kind) {
+            // Extract first meaningful word after ": "
+            let after = log[pos + kind.len()..].trim_start();
+            let after = after.strip_prefix(':').map(|s| s.trim()).unwrap_or(after);
+            let first_word = after.split_whitespace().next().unwrap_or("");
+            let msg = strip_timestamps(first_word);
+            return Some(format!("{}: {}", kind, msg));
+        }
+    }
+
+    // Generic Error: patterns common in Node.js
+    if let Some(pos) = log.find("Error:") {
+        let after = &log[pos + 6..].trim_start();
+        let first_word = after.split_whitespace().next().unwrap_or("");
+        let msg = strip_timestamps(first_word);
+        return Some(format!("Error: {}", msg));
+    }
+
+    None
+}
+
+/// Extracts Python exception type + message prefix from a traceback-like line.
+fn extract_python_error(log: &str) -> Option<String> {
+    // Common pattern: "ExceptionType: message"
+    let python_exceptions = [
+        "ValueError",
+        "TypeError",
+        "KeyError",
+        "IndexError",
+        "AttributeError",
+        "ImportError",
+        "ModuleNotFoundError",
+        "FileNotFoundError",
+        "OSError",
+        "RuntimeError",
+        "RecursionError",
+        "StopIteration",
+        "AssertionError",
+        "OverflowError",
+        "ZeroDivisionError",
+        "UnboundLocalError",
+        "NameError",
+        "SyntaxError",
+        "IndentationError",
+        "TabError",
+        "SystemExit",
+        "KeyboardInterrupt",
+        "ConnectionError",
+        "TimeoutError",
+    ];
+
+    let lower = log.to_lowercase();
+    for exc in &python_exceptions {
+        if lower.contains(&exc.to_lowercase()) {
+            // Found a Python exception name — try to extract the message
+            if let Some(pos) = lower.find(&exc.to_lowercase()) {
+                let after = log[pos + exc.len()..].trim_start();
+                if after.starts_with(':') {
+                    let msg = after[1..].trim();
+                    let msg = strip_timestamps(msg);
+                    let first = msg.split_whitespace().take(4).collect::<Vec<_>>().join(" ");
+                    return Some(format!("{}: {}", exc, first));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Extracts Go (`panic:`, `fatal error:`) or Rust (`panicked at`) panic patterns.
+fn extract_panic(log: &str) -> Option<String> {
+    let lower = log.to_lowercase();
+
+    // Go: "panic: runtime error: invalid memory address"
+    if lower.contains("panic:") {
+        // Extract the key noun after "panic: "/"runtime error: "
+        let after = log.splitn(2, ':').nth(1).unwrap_or("").trim();
+        if after.contains("nil pointer") {
+            return Some("panic: nil pointer dereference".into());
+        }
+        if after.contains("index out of range") {
+            return Some("panic: index out of range".into());
+        }
+        if after.contains("close of closed channel") {
+            return Some("panic: close of closed channel".into());
+        }
+        if after.contains("send on closed channel") {
+            return Some("panic: send on closed channel".into());
+        }
+        if after.contains("concurrent write") || after.contains("concurrent map") {
+            return Some("panic: concurrent map write".into());
+        }
+        // Generic panic: take first 4 words
+        let first = after
+            .split_whitespace()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Some(format!("panic: {}", first));
+    }
+
+    // Go: "fatal error: concurrent map writes"
+    if lower.contains("fatal error:") {
+        let after = log.splitn(2, ':').nth(1).unwrap_or("").trim();
+        let first = after
+            .split_whitespace()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Some(format!("fatal error: {}", first));
+    }
+
+    // Rust: "thread 'main' panicked at 'src/main.rs:42:...'" or "panicked at '...'"
+    if lower.contains("panicked at") || lower.contains("panicked '") {
+        // Find the panic message: text between single quotes AFTER "panicked"
+        let panicked_pos = lower.find("panicked").unwrap();
+        let after_panicked = &log[panicked_pos + 9..];
+        if let Some(start) = after_panicked.find('\'') {
+            let rest = &after_panicked[start + 1..];
+            if let Some(end) = rest.find('\'') {
+                let msg = &rest[..end];
+                let short = msg.chars().take(60).collect::<String>();
+                return Some(format!("panic: {}", short));
+            }
+        }
+        return Some("panic: (unknown)".into());
+    }
+
+    None
+}
+
+/// Extracts test assertion failure patterns from various frameworks.
+fn extract_test_failure(log: &str) -> Option<String> {
+    let lower = log.to_lowercase();
+
+    // Common "expected: X, got: Y" or "expected X but got Y" pattern
+    if lower.contains("expected") && (lower.contains("got") || lower.contains("but")) {
+        if let Some(pos) = lower.find("expected") {
+            let after = log[pos + 8..].trim();
+            let first = after
+                .split_whitespace()
+                .take(6)
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Some(format!("assert: expected {}", first));
+        }
+        return Some("assert: expected vs got".into());
+    }
+
+    // AssertionError [ERR_ASSERTION] (Node.js)
+    if lower.contains("assertionerror") || lower.contains("assertion error") {
+        if let Some(pos) = log.to_uppercase().find("ASSERTION") {
+            let after = log[pos..].chars().take(60).collect::<String>();
+            return Some(format!("assert: {}", after));
+        }
+        return Some("assert: AssertionError".into());
+    }
+
+    // pytest / unittest: "FAILED test_file.py::test_name - AssertionError: ..."
+    if lower.starts_with("failed") && lower.contains("assertion") {
+        return Some("test: failed assertion".into());
+    }
+
+    // Jest / Vitest: "expect(received).toBe(expected)"
+    if (lower.contains("expect(") && lower.contains("toBe(")) || lower.contains("toEqual(") {
+        return Some("test: expect assertion".into());
+    }
+
+    // Rust test failure: "---- test_name stdout ----" + "assertion failed"
+    if lower.contains("assertion failed")
+        || lower.contains("assert_eq!")
+        || lower.contains("assert_ne!")
+    {
+        if let Some(pos) = lower
+            .find("assertion failed")
+            .or_else(|| lower.find("assert_eq!"))
+            .or_else(|| lower.find("assert_ne!"))
+        {
+            let after = &log[pos..];
+            let short = after.chars().take(60).collect::<String>();
+            return Some(format!("assert: {}", short));
+        }
+        return Some("assert: assertion failed".into());
+    }
+
     None
 }
 
@@ -647,9 +820,18 @@ pub async fn fetch_clean_context(pool: &SqlitePool, session_id: &str) -> Result<
 
 /// Consolidates FUTURE constraints when they exceed the threshold.
 ///
+/// Maximum length of a consolidated constraint string. Beyond this, older
+/// lessons are dropped to prevent unbounded token growth across re-consolidations.
+const MAX_CONSOLIDATED_CHARS: usize = 2000;
+
 /// When too many individual constraints accumulate, they become their own
 /// noise. This function merges all FUTURE entries into a single consolidated
 /// constraint and archives the individual ones to PAST.
+///
+/// To prevent unbounded token growth across re-consolidation cycles:
+/// 1. Deduplicates lessons (trimmed, case-insensitive comparison).
+/// 2. Truncates the consolidated string to [`MAX_CONSOLIDATED_CHARS`],
+///    keeping the newest lessons and noting how many were dropped.
 ///
 /// Returns `true` if consolidation was performed.
 pub async fn consolidate_future_constraints(pool: &SqlitePool, session_id: &str) -> Result<bool> {
@@ -670,22 +852,59 @@ pub async fn consolidate_future_constraints(pool: &SqlitePool, session_id: &str)
         return Ok(false);
     }
 
-    // Collect all lessons
-    let lessons: Vec<String> = rows
-        .iter()
-        .filter_map(|(_, summary, _)| summary.clone())
-        .collect();
+    // Collect all lessons, deduplicating by trimmed content (case-insensitive)
+    let mut seen = std::collections::HashSet::new();
+    let mut lessons: Vec<String> = Vec::with_capacity(rows.len());
+    for (_, summary, _) in &rows {
+        if let Some(s) = summary {
+            let key = s.trim().to_lowercase();
+            if seen.insert(key) {
+                lessons.push(s.trim().to_string());
+            }
+        }
+    }
 
     if lessons.is_empty() {
         return Ok(false);
     }
 
-    // Build consolidated constraint
-    let consolidated = format!(
-        "[CONSOLIDATED CONSTRAINTS from {} prior lessons]: {}",
-        lessons.len(),
-        lessons.join(" | ")
-    );
+    // Build consolidated constraint with bounded length
+    let total = lessons.len();
+    let joined = lessons.join(" | ");
+    let (body, dropped) = if joined.len() > MAX_CONSOLIDATED_CHARS {
+        // Walk from the front (newest-first after reversed) to find how many
+        // lessons fit. Since the DB orders ASC (oldest first), newer lessons
+        // are at the end — we want to keep those.
+        let mut budget = MAX_CONSOLIDATED_CHARS;
+        let mut kept: Vec<&str> = Vec::new();
+        for lesson in lessons.iter().rev() {
+            let cost = lesson.len() + if kept.is_empty() { 0 } else { 3 }; // " | " separator
+            if cost > budget {
+                break;
+            }
+            budget -= cost;
+            kept.push(lesson);
+        }
+        kept.reverse();
+        let n_dropped = total - kept.len();
+        (kept.join(" | "), n_dropped)
+    } else {
+        (joined, 0)
+    };
+
+    let consolidated = if dropped > 0 {
+        format!(
+            "[CONSOLIDATED CONSTRAINTS from {} lessons, truncated to {} newest]: {}",
+            total,
+            total - dropped,
+            body
+        )
+    } else {
+        format!(
+            "[CONSOLIDATED CONSTRAINTS from {} prior lessons]: {}",
+            total, body
+        )
+    };
 
     let mut tx = pool.begin().await?;
 
@@ -731,9 +950,12 @@ pub async fn consolidate_future_constraints(pool: &SqlitePool, session_id: &str)
     tx.commit().await?;
 
     tracing::info!(
-        "[CONSOLIDATE] Session '{}': merged {} FUTURE constraints into 1 consolidated entry.",
+        "[CONSOLIDATE] Session '{}': merged {} FUTURE constraints into 1 consolidated entry (dedup {} -> {}, dropped {} chars).",
         session_id,
-        ids.len()
+        ids.len(),
+        rows.len(),
+        total,
+        if dropped > 0 { format!("{} lessons", dropped) } else { "none".into() }
     );
 
     Ok(true)
@@ -852,10 +1074,9 @@ pub async fn revoke_future_constraint(
 }
 // ── Record New Present State ────────────────────────────────────────────────
 
-/// Stores content in the hippocampal layer and creates a PRESENT slot in the
-/// timeline. Called automatically when the agent encounters an error or relevant
-/// state that should be tracked.
-#[allow(dead_code)]
+/// Stores content in `memory_contents` and creates a PRESENT slot in the
+/// timeline. Called when the agent encounters an error or relevant state
+/// that should be tracked.
 pub async fn record_present_state(
     pool: &SqlitePool,
     session_id: &str,
@@ -865,7 +1086,7 @@ pub async fn record_present_state(
 ) -> Result<i64> {
     let mut tx = pool.begin().await?;
 
-    // Insert content in the hippocampal layer
+    // Insert content in memory_contents
     let content_id: i64 = sqlx::query_scalar(
         r#"
         INSERT INTO memory_contents (raw_log, file_context, tool_payload)
