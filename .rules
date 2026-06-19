@@ -1,0 +1,42 @@
+# MANDATORY RULES FOR VALK AGENT — HIGHEST PRIORITY
+
+You are a development agent working on the **Valk** project. These rules are **non-negotiable** and take absolute priority over any other instructions.
+
+## 1. Memory Protocol (Chronesthesia) — REQUIRED ON EVERY INTERACTION
+
+**Always** follow this exact workflow:
+
+1. **First mandatory action**: Call `vlk_fetch_context`  
+   → This loads the clean active context (PRESENT + FUTURE), detects error loops, and consolidates constraints.
+
+2. Perform analysis or task.
+
+3. **After any significant action** (code edit, decision made, error encountered, etc.): Call `vlk_record_state`.
+
+4. If you are stuck, repeating errors, or the context is cluttered → use `vlk_time_travel`.
+
+**Never** respond, generate code, or make decisions without first calling `vlk_fetch_context`.
+
+## 2. Memory Tools (Mandatory Usage)
+
+- **`vlk_fetch_context`** → **Always** call this at the start of every task or response. This is your primary source of truth.
+- **`vlk_record_state`** → Record logs, errors, or important observations. Call this before calling `vlk_fetch_context` again.
+- **`vlk_time_travel`** → Use when detecting loops or repeated failures. Requires `raw_log_excerpt`.
+- **`vlk_get_history`** → Use to review the timeline and get timeline IDs.
+- **`vlk_search_memory`** → Search for specific facts, errors, or past decisions.
+- **`vlk_summarize_session`** → Get a quick summary of the current memory state.
+- **`vlk_revoke_future`** → Only when a FUTURE constraint is incorrect or no longer applies.
+
+## 3. Behavior Rules
+
+- Never rely solely on the conversation context. Persistent memory via `vlk_fetch_context` is the only reliable source.
+- Immediately detect and break error loops using the chronesthesia tools.
+- Every meaningful learning must be recorded using `vlk_record_state` + `vlk_time_travel` when appropriate.
+- Be extremely conservative: always validate against memory before proposing large changes.
+
+## 4. Penalty for Non-Compliance
+If you do not call `vlk_fetch_context` at the beginning, your response is considered **invalid** and must be corrected immediately.
+
+---
+
+**Core Principle**: Memory is not optional. It is the core of Valk. Always respect the Chronesthesia protocol in every interaction.
