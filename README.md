@@ -1,75 +1,139 @@
-# Vlk
+# Vlk — Memory-as-Action for IDE Agents
 
-**Memory that actually helps your agent stop looping.**
+Dead context kills long-running agents. Vlk gives them a scalpel, not a sledgehammer — and doubles as persistent memory for your IDE.
 
-v0.5.0
+## What it does
 
-### The Problem
+Vlk is a native [MCP](https://modelcontextprotocol.io) server implementing **Memory-as-Action** ([MemAct, Zhang et al. 2025](https://arxiv.org/abs/2510.12635)). It acts as persistent working memory for coding agents in Zed, Cursor, or Claude Desktop.
 
-Coding agents (Cursor, Claude in Zed, etc.) get stuck repeating the same errors over and over. The context window fills with noise and the agent becomes ineffective.
+The agent accumulates context: tool outputs, reasoning traces, errors. When it detects a failure loop or context bloat, it calls `vlk_time_travel` — Vlk atomically prunes dead memory slots from SQLite and injects the lesson learned. No external controllers. No fixed heuristics.
 
-Vlk solves this by giving your agent a **sense of time**.
+Unlike ephemeral chat context, Vlk's SQLite-backed `agent_history` table **survives restarts**. Close your editor, reopen tomorrow — the agent picks up with lessons intact and dead ends gone.
 
-### How It Works
+```
+[mem_id:5] London: API error 503
+[mem_id:6] London: API error 503 (retry)
+[mem_id:7] London: API error 503 (retry)
 
-Vlk divides context into three states:
+Agent calls → vlk_time_travel([5,6,7], "London API down, use cached 12°C")
 
-| State      | Meaning                            | Shown to agent |
-|------------|------------------------------------|----------------|
-| **PRESENT**    | What's happening right now         | Yes            |
-| **PAST**       | Errors already learned from        | No             |
-| **FUTURE**     | Lessons to prevent future mistakes | Yes (as constraint) |
+Result: slots 5-7 deleted. Lesson persisted. Context clean. Agent unblocked.
+```
 
-When the agent hits a loop (e.g. 3 identical 503 errors), `vlk_time_travel` archives the errors and adds a clear lesson:
+## Tools
 
-> **[PREVENTIVE FUTURE CONSTRAINT]** Use local cache — endpoint returned 503 five times.
+| Tool | What it does |
+|---|---|
+| `vlk_time_travel` | Prune dead slots by `[mem_id]` and inject a lesson. Atomic DELETE + INSERT. |
+| `vlk_get_history` | Return memory records for a session (with optional `limit`). |
+| `vlk_search_memory` | Full-text search across memory by keyword (`LIKE %query%`). |
+| `vlk_summarize_session` | Condensed summary: total records, lesson count, latest mem_id, token usage. |
 
-### Main Tools
+All tools accept an optional `session_id` (defaults to `"default"`), enabling multi-agent or multi-project isolation.
 
-- **`vlk_fetch_context`** — Get clean context (PRESENT + FUTURE only)
-- **`vlk_time_travel`** — Archive dead errors and create a lesson
-- **`vlk_revoke_future`** — Remove a wrong constraint
-- **`vlk_get_history`** — View full timeline
+## Architecture
 
-### Quick Install
+```
+Zed / Cursor / Claude Desktop
+  │  agent calls tools via stdio JSON-RPC
+  ▼
+vlk-core (Rust binary, single-file)
+  │  tools/list  → 4 MCP tools exposed
+  │  tools/call  → atomic SQLite operations
+  ▼
+SQLite (WAL mode)
+  │  agent_history table
+  │  UNIQUE INDEX on (session_id, mem_id)
+  │  created_at, parent_mem_id, importance
+```
+
+## Schema
+
+```sql
+CREATE TABLE agent_history (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       TEXT NOT NULL,
+    mem_id           INTEGER NOT NULL,
+    role             TEXT NOT NULL,
+    content          TEXT NOT NULL,
+    tokens_estimated INTEGER NOT NULL,
+    tool_call_id     TEXT,
+    tool_calls       TEXT,
+    created_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
+    parent_mem_id    INTEGER,
+    importance       REAL DEFAULT 1.0
+);
+
+CREATE UNIQUE INDEX idx_session_mem   ON agent_history(session_id, mem_id);
+CREATE INDEX        idx_session_created ON agent_history(session_id, created_at DESC);
+```
+
+## Use cases
+
+| Scenario | Agent behavior |
+|---|---|
+| **API retry storm** | Agent hits same endpoint 6× with 503. Detects loop, prunes failed attempts, injects "use fallback". Continues without wasting context. |
+| **Contradictory tool output** | Two search calls return conflicting facts. Agent prunes the stale one, keeps the verified source, notes the resolution. |
+| **Context window pressure** | Long-running task accumulating dead branches. Agent periodically prunes abandoned reasoning paths, reclaims tokens. |
+| **Multi-turn task decomposition** | Agent explores 5 approaches, 4 dead-end. Prunes dead ends, keeps winning strategy + rationale for downstream steps. |
+| **Self-correction** | Agent realizes early assumption was wrong. Prunes reasoning built on it, injects corrected premise, re-derives from clean state. |
+| **IDE session persistence** | Close Zed, reopen tomorrow. Agent reads `agent_history`, sees pruned failures + injected lessons from yesterday. Doesn't repeat mistakes. |
+
+## Run
 
 ```bash
 git clone https://github.com/aranajhonny/vlk.git
 cd vlk/vlk-core
 cargo build --release
-Run the server:
-Bash./target/release/vlk-core
 ```
 
-Setup in Zed
+Your IDE's agent will use `vlk.db` (created automatically on first run) as persistent memory across sessions.
+
+### Zed
+
 ```json
-JSON// .zed/settings.json
+// .zed/settings.json
 {
   "context_servers": {
     "vlk": {
-      "command": "/path/to/vlk-core",
+      "command": "/absolute/path/to/vlk-core/target/release/vlk-core",
       "env": {
-        "DATABASE_URL": "sqlite:/path/to/vlk.db?mode=rwc"
+        "DATABASE_URL": "sqlite:/absolute/path/to/vlk-core/vlk.db?mode=rwc"
       }
     }
   }
 }
 ```
 
-Basic Usage
+### Cursor / Claude Desktop
+
+Same pattern — point `command` at the binary. See [MCP docs](https://modelcontextprotocol.io/docs).
+
+## Smoke test
+
+```bash
+echo '{"jsonrpc":"2.0","method":"tools/list","id":1}' | ./target/release/vlk-core
+# → 4 tools listed: time_travel, get_history, search_memory, summarize_session
+
+echo '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"vlk_time_travel","arguments":{"target_mem_ids":[1],"learning":"test"}},"id":2}' | ./target/release/vlk-core
+# → "1 slots pruned, N tokens saved. Lesson injected"
 ```
-Call vlk_fetch_context before every agent turn
-When you detect a loop, call vlk_time_travel with a clear lesson
-The agent only sees useful lessons — never the repeated noise again
+
+## Stack
+
+Rust · Tokio · SQLx · SQLite WAL · JSON-RPC 2.0 · stdio transport · chrono · tracing
+
+## Citation
+
+```bibtex
+@article{zhang2025memact,
+  title  = {Memory as Action: Autonomous Context Curation for Long-Horizon Agentic Tasks},
+  author = {Zhang, Yuxiang and Shu, Jiangming and Ma, Ye and Lin, Xueyuan and Wu, Shangxi and Sang, Jitao},
+  year   = {2025},
+  url    = {https://arxiv.org/abs/2510.12635}
+}
 ```
 
-Vlk also automatically detects and mitigates loops of 3+ similar errors.
-Benefits
+## License
 
-Dramatically reduces token usage
-Prevents repetitive error loops
-Persists across IDE restarts
-Lightweight (Rust + SQLite)
-Works with Cursor, Zed, and any MCP client
-
-License: MIT
+MIT
